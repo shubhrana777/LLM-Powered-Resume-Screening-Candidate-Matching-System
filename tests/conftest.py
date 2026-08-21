@@ -355,3 +355,59 @@ def analyst_resume_dir(tmp_path: Path) -> Path:
         _write_pdf(folder / f"{stem}.pdf", [text.splitlines()])
 
     return folder
+
+
+# --------------------------------------------------------------------------
+# Phase 4 fixtures
+# --------------------------------------------------------------------------
+
+# Two candidates with deliberately disjoint vocabulary, so cross-contamination
+# between them is unmistakable in a test failure.
+ISOLATION_RESUME_A = """Alice Alpha
+Backend Engineer
+
+EXPERIENCE
+Built python services and wrote sql queries against the database.
+Designed api endpoints and tuned database indexes for the python backend.
+More python work on the api layer, plus sql reporting for the database team.
+
+SKILLS
+python, sql, database, api
+"""
+
+ISOLATION_RESUME_B = """Bob Beta
+Platform Engineer
+
+EXPERIENCE
+Ran kubernetes clusters and built docker images for the platform.
+Automated kubernetes rollouts and hardened docker builds across the estate.
+Further kubernetes and docker work, including registry and cluster upgrades.
+
+SKILLS
+kubernetes, docker
+"""
+
+LONG_RESUME_TEXT = " ".join(f"word{index}" for index in range(500))
+
+
+@pytest.fixture
+def isolation_candidates() -> list[Candidate]:
+    """Two candidates whose resumes share no vocabulary."""
+    return [
+        Candidate("cand-a", ISOLATION_RESUME_A, "Alice Alpha"),
+        Candidate("cand-b", ISOLATION_RESUME_B, "Bob Beta"),
+    ]
+
+
+@pytest.fixture
+def long_resume_candidate() -> Candidate:
+    """A candidate whose resume is long enough to need several chunks."""
+    return Candidate("cand-long", LONG_RESUME_TEXT, "Long Resume")
+
+
+@pytest.fixture
+def isolation_embedder() -> FakeEmbedder:
+    """An offline embedder whose vocabulary covers both isolation resumes."""
+    return FakeEmbedder(
+        ("python", "sql", "database", "api", "kubernetes", "docker", "backend", "platform")
+    )

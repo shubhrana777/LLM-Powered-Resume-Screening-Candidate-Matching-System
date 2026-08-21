@@ -163,21 +163,39 @@ SAMPLE_RESUMES: dict[str, list[str]] = {
         "SUMMARY",
         "Financial analyst with 4 years of experience in budgeting,",
         "forecasting and management reporting for mid-sized businesses.",
+        "Comfortable owning the numbers end to end, from data extraction",
+        "through to the commentary that goes in front of the board.",
         "",
         "EXPERIENCE",
         "Senior Financial Analyst, Northgate Retail (2022-2025)",
-        "Built rolling forecasts and financial modeling for a 40M revenue unit.",
-        "Automated monthly management reporting using Python and SQL,",
-        "cutting the close cycle from nine days to four.",
-        "Developed Power BI dashboards used by the executive team.",
+        "Owned the rolling 18-month forecast for a 40M revenue business unit,",
+        "rebuilding the financial modeling in Excel around driver-based",
+        "assumptions rather than prior-year uplift. Forecast accuracy on",
+        "revenue improved from plus or minus 11 percent to plus or minus 4.",
+        "Automated monthly management reporting using Python and SQL against",
+        "the finance data warehouse, cutting the close cycle from nine",
+        "working days to four and removing roughly 30 hours of manual",
+        "spreadsheet work each month.",
+        "Developed a suite of Power BI dashboards covering gross margin,",
+        "working capital and store-level contribution, adopted by the",
+        "executive team as the standard monthly pack.",
+        "Partnered with category buyers on pricing scenarios, quantifying",
+        "the margin impact of promotional plans before sign-off.",
         "",
         "Financial Analyst, Kestrel Group (2021-2022)",
-        "Produced variance analysis and supported budget planning.",
-        "Performed risk analysis on supplier exposure.",
+        "Produced monthly variance analysis across eight cost centres and",
+        "presented drivers to budget holders. Supported the annual budget",
+        "planning cycle, consolidating submissions from four departments.",
+        "Performed risk analysis on supplier concentration and currency",
+        "exposure, flagging two single-source dependencies that were",
+        "subsequently dual-sourced.",
+        "Built the reconciliation process for intercompany balances,",
+        "reducing unexplained differences at close from 40k to under 2k.",
         "",
         "SKILLS",
         "Excel, financial modeling, forecasting, SQL, Python, Power BI,",
-        "Tableau, budgeting, risk analysis, data analysis, statistics",
+        "Tableau, budgeting, risk analysis, data analysis, statistics,",
+        "variance analysis, management reporting, accounting",
         "",
         "EDUCATION",
         "MBA in Finance, Manchester Business School (2021)",
@@ -190,16 +208,27 @@ SAMPLE_RESUMES: dict[str, list[str]] = {
         "",
         "SUMMARY",
         "Finance associate with 2 years of experience supporting month-end",
-        "reporting and reconciliations.",
+        "reporting and reconciliations for a logistics business.",
         "",
         "EXPERIENCE",
         "Finance Associate, Ridgeway Logistics (2023-2025)",
-        "Prepared monthly reconciliations and assisted with budgeting.",
-        "Maintained reporting workbooks in Excel and ran SQL queries",
-        "against the finance data warehouse.",
+        "Prepared monthly balance sheet reconciliations across 12 accounts",
+        "and cleared ageing items with operations and procurement.",
+        "Assisted the finance manager with the annual budgeting cycle,",
+        "collating departmental submissions and checking them against",
+        "prior-year actuals before consolidation.",
+        "Maintained the management reporting workbooks in Excel, including",
+        "the fuel and fleet cost trackers reviewed each month.",
+        "Ran SQL queries against the finance data warehouse to pull",
+        "transaction detail for month-end accruals and audit samples.",
+        "Supported the external audit, preparing supporting schedules and",
+        "responding to sample requests.",
+        "Processed supplier invoices and resolved pricing queries with",
+        "the procurement team.",
         "",
         "SKILLS",
-        "Excel, SQL, budgeting, accounting, reporting, attention to detail",
+        "Excel, SQL, budgeting, accounting, reconciliations, month-end",
+        "reporting, accounts payable, attention to detail",
         "",
         "EDUCATION",
         "B.Com Accounting and Finance, Aston University (2023)",
@@ -211,18 +240,33 @@ SAMPLE_RESUMES: dict[str, list[str]] = {
         "",
         "SUMMARY",
         "Graphic designer focused on brand identity, packaging and print.",
+        "Work spans independent food producers through to regional retail.",
         "",
         "EXPERIENCE",
         "Senior Graphic Designer, Studio Vlna",
-        "Led brand identity projects for food and beverage clients.",
-        "Art directed packaging ranges and produced print-ready artwork.",
+        "Led brand identity projects for food and beverage clients, taking",
+        "each from discovery workshops through logo, palette and type",
+        "system to a delivered brand guidelines document.",
+        "Art directed packaging ranges across bottles, cartons and labels,",
+        "producing print-ready artwork to each printer's specification and",
+        "attending press checks for colour-critical runs.",
+        "Rebranded a regional bakery chain across 34 shopfronts, including",
+        "signage, menu boards and takeaway packaging.",
+        "Managed two junior designers and reviewed their artwork before",
+        "it went to print.",
         "",
         "Graphic Designer, Prisma Creative",
-        "Designed posters, brochures and social campaigns.",
+        "Designed posters, brochures and social campaigns for cultural",
+        "clients including a city theatre and a music festival.",
+        "Prepared layouts for large-format print and coordinated with",
+        "production suppliers on stock and finishing choices.",
+        "Built reusable InDesign templates that cut studio turnaround on",
+        "recurring event material.",
         "",
         "SKILLS",
         "Illustrator, Photoshop, InDesign, typography, branding,",
-        "packaging design, print production, art direction",
+        "packaging design, print production, art direction, layout,",
+        "colour management, brand guidelines",
         "",
         "EDUCATION",
         "Diploma in Graphic Design, Prague College of Art",
@@ -255,8 +299,13 @@ SAMPLE_RESUMES: dict[str, list[str]] = {
 }
 
 
+TOP_MARGIN = 60
+BOTTOM_MARGIN = 60
+PAGE_HEIGHT = 792  # US Letter, the PyMuPDF default
+
+
 def write_resume_pdf(path: Path, lines: list[str]) -> Path:
-    """Write ``lines`` to a single-page PDF at ``path``.
+    """Write ``lines`` to a PDF at ``path``, paginating as needed.
 
     Args:
         path: Destination PDF path.
@@ -268,12 +317,19 @@ def write_resume_pdf(path: Path, lines: list[str]) -> Path:
     document = fitz.open()
     try:
         page = document.new_page()
-        y = 60
+        y = TOP_MARGIN
+
         for position, line in enumerate(lines):
             size = 15 if position == 0 else 10
+
+            if y > PAGE_HEIGHT - BOTTOM_MARGIN:
+                page = document.new_page()
+                y = TOP_MARGIN
+
             if line:
                 page.insert_text((60, y), line, fontsize=size)
             y += size + 5
+
         document.save(path)
     finally:
         document.close()

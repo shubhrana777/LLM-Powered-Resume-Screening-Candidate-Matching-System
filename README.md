@@ -1,17 +1,18 @@
 # LLM-Powered Resume Screening & Candidate Matching System
 
 A system that ranks candidates against a job description. It is built in phases;
-**Phases 1 to 3 are complete**.
+**Phases 1 to 4 are complete**.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | PDF resume ingestion and text extraction | Done |
 | 2 | Semantic matching with embeddings and FAISS | Done |
 | 3 | Skill extraction and candidate analysis | Done |
-| 4+ | LLM/RAG, API, dashboard, Docker | Not started |
+| 4 | LLM analysis grounded in retrieved evidence (RAG) | Done |
+| 5+ | REST API, dashboard, Docker | Not started |
 
-Explicitly **not** implemented yet: LLM calls, LangChain, RAG, FastAPI,
-Streamlit, Docker, databases, authentication, and OCR for scanned PDFs.
+Explicitly **not** implemented yet: FastAPI, Streamlit, Docker, databases,
+authentication, deployment, and OCR for scanned PDFs.
 
 ## Phase 1 scope — resume parsing
 
@@ -39,6 +40,16 @@ Streamlit, Docker, databases, authentication, and OCR for scanned PDFs.
 
 All Phase 3 extraction is deterministic string matching. No model is involved.
 
+## Phase 4 scope — LLM + RAG
+
+- Chunk resumes and index the chunks for retrieval.
+- Retrieve the passages relevant to a job description, per candidate.
+- Build a grounded prompt from job description + Phase 3 profile + evidence.
+- Call an LLM through a provider abstraction (offline default, no key needed).
+- Parse the response into a typed `CandidateAnalysis`.
+- Validate every claim against the deterministic profile and correct it.
+- Keep the supporting evidence attached to the analysis.
+
 ## Project structure
 
 ```
@@ -55,8 +66,15 @@ resume-screening-ai/
 │   ├── experience_extractor.py  # Phase 3: stated years of experience
 │   ├── education_extractor.py   # Phase 3: degree extraction
 │   ├── candidate_analyzer.py    # Phase 3: builds CandidateProfile records
+│   ├── chunker.py           # Phase 4: deterministic resume chunking
+│   ├── retriever.py         # Phase 4: per-candidate FAISS retrieval
+│   ├── rag_context.py       # Phase 4: assembles the grounded context
+│   ├── prompts.py           # Phase 4: prompt templates + grounding rules
+│   ├── llm.py               # Phase 4: provider abstraction
+│   ├── analysis_parser.py   # Phase 4: parses + validates LLM output
+│   ├── rag_pipeline.py      # Phase 4: end-to-end orchestration
 │   ├── models.py            # Typed records shared across phases
-│   └── main.py              # CLI: `extract`, `match`, `analyze` subcommands
+│   └── main.py              # CLI: extract / match / analyze / rag subcommands
 │
 ├── data/
 │   ├── resumes/             # Put your PDFs here (git-ignored)
@@ -77,6 +95,13 @@ resume-screening-ai/
 │   ├── test_experience_extractor.py
 │   ├── test_education_extractor.py
 │   ├── test_candidate_analyzer.py
+│   ├── test_chunker.py
+│   ├── test_retriever.py
+│   ├── test_rag_context.py
+│   ├── test_llm.py
+│   ├── test_analysis_parser.py
+│   ├── test_rag_pipeline.py
+│   ├── test_real_llm.py     # opt-in, needs credentials
 │   ├── test_integration.py
 │   └── test_integration_phase3.py
 │
@@ -522,6 +547,292 @@ extract_years_of_experience("4 years of experience")   # 4.0
 extract_education("MBA in Finance")                    # (EducationEntry('MBA', 'Finance', ...),)
 ```
 
+## Phase 4 — LLM analysis grounded in retrieved evidence
+
+```bash
+python -m app.main rag --job-description data/job_descriptions/financial_analyst.txt
+```
+
+This runs with **no API key**: the default provider is an offline deterministic
+one. Point it at a real model when you want real prose (see *Configuration*).
+
+Useful options:
+
+```bash
+# One candidate only (the resume file stem)
+python -m app.main rag -j data/job_descriptions/financial_analyst.txt --candidate sarah_wilson
+
+# Top 3 ranked candidates, evidence hidden
+python -m app.main rag -j data/job_descriptions/financial_analyst.txt -k 3 --hide-evidence
+
+# Tune chunking and how much evidence the model sees
+python -m app.main rag -j <job.txt> --chunk-size 60 --chunk-overlap 15 --evidence-k 5
+
+# Use a real model for this run
+python -m app.main rag -j <job.txt> --llm-provider anthropic --llm-model claude-opus-5
+```
+
+### Example output
+
+```
+Candidate: Sarah Wilson
+Recommendation: STRONG_MATCH
+
+Summary:
+  Sarah Wilson matches 12 of 13 skills identified in the job description. ...
+
+Matched Skills:
+  - Python
+  - SQL
+  - Excel
+  ...
+
+Skill Gaps:
+  - Investment Analysis
+
+Experience:
+  The resume states 4 years (stated on resume); the job asks for 3 years. Requirement met: yes.
+
+Evidence (verbatim resume passages given to the model):
+  - [sarah_wilson#4, similarity=0.6709]
+    Python, Power BI, Tableau, budgeting, risk analysis, data analysis, statistics, ...
+  - [sarah_wilson#1, similarity=0.5596]
+    for a 40M revenue business unit, rebuilding the financial modeling in Excel around ...
+```
+
+For a candidate whose resume never states a duration:
+
+```
+Experience:
+  Not stated. The resume does not state a number of years, so this cannot be
+  compared against the requirement of 3 years.
+```
+
+### How the three phases differ
+
+| | What it produces | How it decides | Fails by |
+| --- | --- | --- | --- |
+| **Phase 2** | A ranked list with a similarity score | Cosine similarity between whole-document embeddings | Ranking a superficially similar resume above a genuinely better one |
+| **Phase 3** | Structured fields: skills, experience, education | Exact matching against a fixed taxonomy | Missing anything phrased unusually or absent from the taxonomy |
+| **Phase 4** | Prose summary, recommendation, reasoning about gaps | An LLM reading retrieved resume passages | Being fluent and wrong |
+
+They are complementary, and Phase 4 depends on both: it puts the Phase 3 profile
+*and* retrieved passages in front of the model, then validates what comes back
+against the Phase 3 profile.
+
+### Why RAG rather than pasting the whole resume
+
+For a one-page resume, sending the full text would fit. Retrieval is used anyway
+for three reasons:
+
+1. **Attribution.** The output carries the exact passages that informed it, so a
+   recruiter can check a claim without rereading the resume. With a whole-resume
+   prompt there is nothing to point at.
+2. **The embedding model truncates.** `all-MiniLM-L6-v2` stops at 256 word
+   pieces. The bundled Sarah Wilson resume is 378 — as a single vector, its
+   entire skills and education section is invisible. Chunking makes every part
+   reachable.
+3. **It keeps the prompt bounded** as resumes and candidate pools grow.
+
+### The pipeline
+
+```
+resume PDF
+    ↓  app/resume_parser.py        (Phase 1)
+resume text
+    ↓  app/chunker.py              80-word windows, 20-word overlap
+chunks
+    ↓  app/embeddings.py           (Phase 2, reused — no second implementation)
+vectors
+    ↓  app/retriever.py            one FAISS index per candidate
+relevant passages
+    │
+    ├── job description  ─────────┐
+    ├── candidate profile ────────┤  app/rag_context.py
+    └── retrieved evidence ───────┘
+                ↓  app/prompts.py         grounding rules
+              prompt
+                ↓  app/llm.py             provider abstraction
+            raw response
+                ↓  app/analysis_parser.py validation against the profile
+          CandidateAnalysis
+```
+
+### Chunking
+
+Fixed-size sliding window over words, with overlap. Deliberately simple — no
+sentence models, no semantic clustering — so it is deterministic and easy to
+reason about when a chunk looks wrong.
+
+- Boundaries always fall between words; words are never split.
+- Each chunk is the original substring spanning its first and last word, so
+  punctuation and line breaks inside a chunk survive exactly.
+- Overlap means a fact straddling a boundary still appears whole somewhere.
+- Defaults: 80 words with 20 overlap. 80 words is ~110–150 word pieces, well
+  inside the 256 cap, and small enough that a retrieved chunk is a *passage*
+  rather than most of the resume.
+
+Chunks carry `candidate_id`, `chunk_id`, `text`, `index`, `source` and character
+offsets. There is no page number: the Phase 1 parser joins pages into one string
+and does not report boundaries, and inventing one would mean rewriting the
+parser or guessing.
+
+### Retrieval
+
+`app/retriever.py` reuses the Phase 2 embedder and FAISS store. Retrieval runs
+several queries per candidate — the job description plus one per required skill
+— because a brief mention of a single requirement is easily outranked by overall
+topical similarity when only one query is used. Results are merged, deduplicated
+by chunk, and each chunk keeps its best score.
+
+`retrieval_score` is cosine similarity in `[-1, 1]`. It is a **similarity
+score**, not a probability and not a confidence that a passage answers the query.
+
+### Candidate isolation
+
+Mixing one person's resume into another's analysis is the worst thing this
+system could do, so isolation is **structural rather than a filter**: each
+candidate gets their own FAISS index, and a scoped search physically cannot
+reach another candidate's vectors.
+
+A single shared index with post-search filtering was rejected deliberately. It
+leaks subtly: with `top_k=5`, all five nearest vectors can belong to someone
+else, leaving the requested candidate with nothing — and any bug in the filter
+produces contamination rather than an error. `app/rag_context.py` re-checks the
+invariant and raises `ContextIsolationError` rather than quietly dropping
+foreign evidence.
+
+### Grounding and hallucination safeguards
+
+Grounding is enforced in **two independent layers**, because a prompt is a
+request, not a guarantee.
+
+**Layer 1 — the prompt** (`app/prompts.py`) instructs the model to use only the
+supplied material, to write exactly `Not stated` when a fact is absent, not to
+infer skills from job titles or years from employment dates, and not to invent
+employers, degrees, certifications or projects.
+
+**Layer 2 — validation** (`app/analysis_parser.py`) checks what came back
+against the deterministic Phase 3 profile and *corrects* it:
+
+| Model claim | What happens |
+| --- | --- |
+| A skill absent from the resume | Removed from `matched_skills`, warning recorded |
+| A gap the job never asked for | Removed from `skill_gaps`, warning recorded |
+| A recommendation outside the vocabulary | Becomes `INSUFFICIENT_INFORMATION` |
+| Years of experience when the resume states none | Replaced with `Not stated`, warning recorded |
+| A degree the resume does not contain | Flagged (reusing the Phase 3 education extractor) |
+| Its own "evidence" | Ignored — evidence comes from retrieval, never from the model |
+
+Every correction lands in `CandidateAnalysis.warnings`, and `is_grounded` is
+`False` when any was needed. Fed a deliberately lying model, all six fabrications
+below were caught:
+
+```
+claimed: Python, SQL, AWS, Kubernetes   ->  kept: ()
+claimed gap: Fortran                    ->  kept: ()
+claimed: DEFINITELY_HIRE                ->  kept: INSUFFICIENT_INFORMATION
+claimed: 12 years of experience         ->  kept: "Not stated. The resume does not state..."
+claimed: PhD in Econometrics            ->  flagged
+grounded: False
+```
+
+**This reduces hallucination; it does not eliminate it.** Free prose can be
+subtly wrong in ways no automated check catches — a plausible-sounding
+paraphrase, a wrong emphasis, an unstated inference. That is precisely why the
+retrieved evidence travels with every analysis: the output is meant to be
+checked, not trusted.
+
+### Structured output
+
+The model is asked for a single JSON object. `CandidateAnalysis` carries
+`candidate_id`, `candidate_name`, `summary`, `recommendation`, `matched_skills`,
+`skill_gaps`, `experience_assessment`, `evidence`, `limitations`, `model_name`
+and `warnings`.
+
+`Recommendation` is a controlled vocabulary — `STRONG_MATCH`, `GOOD_MATCH`,
+`PARTIAL_MATCH`, `WEAK_MATCH`, `INSUFFICIENT_INFORMATION`. It is a coarse
+ordinal label, **not a score and not a probability**, and never a hiring
+decision. Anything outside the vocabulary becomes `INSUFFICIENT_INFORMATION`
+rather than being coerced into the nearest-looking value.
+
+Responses wrapped in a markdown fence or surrounded by a sentence are tolerated;
+anything else raises `AnalysisParseError`.
+
+### Evidence
+
+Every analysis retains the passages the model was shown, each with
+`candidate_id`, `chunk_id`, `text` and `retrieval_score`, so a recruiter can see
+where a conclusion came from. Evidence is source text only — never the model's
+internal reasoning, which is neither requested nor displayed.
+
+### Configuration
+
+| Variable | Meaning |
+| --- | --- |
+| `LLM_PROVIDER` | `fake` (default), `anthropic`, or `langchain` |
+| `LLM_MODEL` | Model id; default `claude-opus-5` |
+| `LLM_API_KEY` | API key; `ANTHROPIC_API_KEY` also accepted |
+| `LLM_MAX_TOKENS` | Response cap; default 4096 |
+
+Keys are read from the environment only. Nothing writes a key to disk or logs
+one, `.env` is git-ignored, and no key is needed to run the CLI or the tests.
+
+To use a real model:
+
+```bash
+pip install anthropic==1.0.0
+export LLM_PROVIDER=anthropic
+export LLM_API_KEY=sk-ant-...
+python -m app.main rag -j data/job_descriptions/financial_analyst.txt --candidate sarah_wilson
+```
+
+**On LangChain.** `app/llm.py` ships a `LangChainProvider` that adapts any
+LangChain chat model, which is where LangChain earns real value here: one
+adapter buys every backend LangChain supports. The rest of the project does not
+import it — retrieval, prompting and output parsing are ~200 lines of standard
+library over the existing FAISS stack, and wrapping them in LangChain
+abstractions would add dependencies without changing behaviour.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from app.llm import LangChainProvider
+from app.rag_pipeline import RagPipeline
+
+pipeline = RagPipeline(llm=LangChainProvider(ChatAnthropic(model="claude-opus-5")))
+```
+
+### Using Phase 4 as a library
+
+```python
+from pathlib import Path
+
+from app.matching import load_candidates_from_directory
+from app.rag_pipeline import RagPipeline
+
+loaded = load_candidates_from_directory("data/resumes")
+job = Path("data/job_descriptions/financial_analyst.txt").read_text(encoding="utf-8")
+
+pipeline = RagPipeline()                       # offline provider by default
+pipeline.index_candidates(loaded.candidates)   # chunk + embed once
+
+analysis = pipeline.analyze_candidate("sarah_wilson", job)
+
+print(analysis.recommendation.value)
+print(analysis.summary)
+for item in analysis.evidence:
+    print(item.chunk_id, round(item.retrieval_score, 4), item.text[:80])
+
+if not analysis.is_grounded:
+    for warning in analysis.warnings:
+        print("corrected:", warning)
+```
+
+Indexing is separate from analysis, so one indexed pool can be analysed against
+several job descriptions without re-chunking or re-embedding. `analyze_all`
+ranks with the Phase 2 matcher first, then analyses in rank order — one model
+call per candidate, which is what `-k` controls.
+
 ## Using the engine as a library
 
 ```python
@@ -550,10 +861,15 @@ ml_role = matcher.match("NLP engineer, PyTorch and embeddings")
 ## Running the tests
 
 ```bash
-pytest                    # everything
-pytest -m "not model"     # offline only, no model download
-pytest -m model           # only the tests that use real model weights
+pytest                       # everything that runs offline
+pytest -m "not model"        # skip even the embedding-model tests
+pytest -m model              # only tests using real embedding weights
+pytest -m llm                # only tests calling a real LLM (needs credentials)
 ```
+
+The default run needs **no API key and no network**: the LLM tests are marked
+`llm` and skip unless `LLM_PROVIDER`/`LLM_API_KEY` are set, and Phase 4 itself
+defaults to an offline deterministic provider.
 
 Most tests run against a deterministic bag-of-words `FakeEmbedder` defined in
 `tests/conftest.py`, so the suite is fast, offline, and reproducible. Depending
@@ -664,6 +980,46 @@ output is a structured, checkable summary of what a resume *says*, next to a
 semantic similarity score — intended to help a human review faster, not to
 screen anyone out automatically. Every field is either extracted verbatim or
 reported as unknown.
+
+### LLM and RAG (Phase 4)
+
+- **Hallucination is reduced, not eliminated.** Unsupported skills, invented
+  durations, invented degrees and out-of-vocabulary recommendations are caught
+  and corrected. Free prose is not fully checkable: a fluent paraphrase that
+  subtly misstates emphasis, or an inference the resume does not support, can
+  survive. Read the evidence before acting on a conclusion.
+- **The validator checks claims against the Phase 3 profile**, so it inherits
+  every Phase 3 limitation. A skill missing from the taxonomy is absent from the
+  profile, which means a model correctly citing it from the evidence would have
+  that claim stripped as "unsupported". The safeguard errs toward removing
+  claims rather than keeping them.
+- **Invented employers, projects and achievements are not detected.** There is
+  no ground-truth list to check them against, unlike skills and degrees. The
+  prompt forbids them; nothing verifies it.
+- **Retrieval can miss the relevant passage.** If the embedding does not place a
+  requirement near the passage that satisfies it, that passage is never shown to
+  the model, and the analysis will report a gap that the resume actually covers.
+  Retrieval quality is bounded by the same small MiniLM model as Phase 2.
+- **Only the top `--evidence-k` passages are shown** (4 by default). Everything
+  else in the resume is invisible to the model for that run, even though it was
+  indexed.
+- **Chunking is positional, not semantic.** An 80-word window can split a role
+  from its dates or a bullet from its heading. Overlap mitigates this; it does
+  not remove it.
+- **The recommendation is a coarse label, not a measurement.** It is not
+  calibrated, not comparable across job descriptions, and not a hiring decision.
+- **The offline default provider is not a language model.** It produces valid,
+  grounded, deterministic JSON from the profile — enough to exercise and
+  demonstrate the pipeline, and nothing like real model prose or real model
+  failure modes. Output labelled `fake/deterministic-v1` was not generated by an
+  LLM.
+- **Cost and latency scale with candidates.** `analyze_all` makes one model call
+  per candidate; use `-k` to bound it.
+- **No caching.** Re-running re-chunks, re-embeds and re-calls the model.
+- **Automated screening is not the intent.** The output orders and summarises
+  resumes for a human reviewer. Embedding similarity reflects patterns in the
+  model's training data and can carry those biases; an LLM summary can carry
+  them too.
 
 ### Matching engine
 

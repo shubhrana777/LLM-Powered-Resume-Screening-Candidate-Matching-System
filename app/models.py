@@ -7,7 +7,8 @@ identifier plus a score.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 __all__ = [
@@ -18,6 +19,9 @@ __all__ = [
     "EducationEntry",
     "JobRequirements",
     "CandidateProfile",
+    "NOT_STATED",
+    "Recommendation",
+    "CandidateAnalysis",
 ]
 
 
@@ -218,3 +222,104 @@ class CandidateProfile:
             missing=self.missing_skills,
             additional=self.additional_skills,
         )
+
+
+# The exact wording the LLM must use when a fact is absent from the evidence.
+# Kept as a constant so the prompt, the parser and the tests cannot drift apart.
+NOT_STATED = "Not stated"
+
+
+class Recommendation(str, Enum):
+    """Controlled vocabulary for an LLM hiring-review recommendation.
+
+    A coarse, ordinal label -- deliberately not a score and not a probability.
+    It expresses how well the retrieved evidence supports the stated
+    requirements, nothing more, and never constitutes a hiring decision.
+
+    ``INSUFFICIENT_INFORMATION`` is the correct answer whenever the evidence
+    does not support any judgement, and is the safe fallback when an analysis
+    cannot be trusted.
+    """
+
+    STRONG_MATCH = "STRONG_MATCH"
+    GOOD_MATCH = "GOOD_MATCH"
+    PARTIAL_MATCH = "PARTIAL_MATCH"
+    WEAK_MATCH = "WEAK_MATCH"
+    INSUFFICIENT_INFORMATION = "INSUFFICIENT_INFORMATION"
+
+    @classmethod
+    def values(cls) -> tuple[str, ...]:
+        """Every permitted value, in descending order of strength."""
+        return tuple(member.value for member in cls)
+
+    @classmethod
+    def parse(cls, value: object) -> Recommendation | None:
+        """Coerce ``value`` to a member, or ``None`` if it is not one.
+
+        Args:
+            value: Candidate value, typically a string from LLM output.
+
+        Returns:
+            The matching member, or ``None``. Comparison ignores case and
+            surrounding whitespace; anything else is rejected rather than
+            guessed at.
+        """
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            return None
+        try:
+            return cls(value.strip().upper().replace(" ", "_").replace("-", "_"))
+        except ValueError:
+            return None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateAnalysis:
+    """An LLM analysis of one candidate, grounded in retrieved resume evidence.
+
+    Every field is either supported by the supplied evidence and profile, or
+    reports absence explicitly. Nothing here is inferred from outside the
+    material the model was given.
+
+    Attributes:
+        candidate_id: Candidate this analysis is about.
+        candidate_name: Candidate name, when known.
+        summary: Short prose summary of the candidate against the role.
+        recommendation: Controlled-vocabulary label; see :class:`Recommendation`.
+        matched_skills: Required skills the evidence supports.
+        skill_gaps: Required skills not supported by the evidence.
+        experience_assessment: Prose comparison of stated experience against the
+            stated requirement, or ``"Not stated"`` when the resume gives none.
+        evidence: The passages supplied to the model, retained so a reviewer can
+            check any claim against source text. Source excerpts only -- never
+            the model's internal reasoning.
+        limitations: What this analysis could not determine, in the model's own
+            words plus any caveats added by the parser.
+        model_name: Identifier of the provider/model that produced it.
+        warnings: Grounding problems detected while validating the response,
+            such as a claimed skill absent from the candidate profile. A
+            non-empty list means the raw output was corrected before use.
+    """
+
+    candidate_id: str
+    candidate_name: str | None = None
+    summary: str = NOT_STATED
+    recommendation: Recommendation = Recommendation.INSUFFICIENT_INFORMATION
+    matched_skills: tuple[str, ...] = ()
+    skill_gaps: tuple[str, ...] = ()
+    experience_assessment: str = NOT_STATED
+    evidence: tuple[object, ...] = ()
+    limitations: tuple[str, ...] = ()
+    model_name: str = "unknown"
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def display_name(self) -> str:
+        """The candidate name if known, otherwise the candidate id."""
+        return self.candidate_name or self.candidate_id
+
+    @property
+    def is_grounded(self) -> bool:
+        """Whether validation found no unsupported claims in the raw output."""
+        return not self.warnings

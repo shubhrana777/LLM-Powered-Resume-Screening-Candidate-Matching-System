@@ -9,5 +9,24 @@ faiss-cpu==1.13.2
 # it is declared explicitly rather than relied on as a transitive dependency.
 numpy==2.5.2
 
+# Phase 3 -- skill, experience and education extraction
+# Standard library only (re, json, dataclasses, pathlib). Nothing to install.
+
+# Phase 4 -- LLM + RAG
+# Chunking, retrieval, prompting and output validation are standard library on
+# top of the Phase 2 embedding/FAISS stack. The only new dependency is the SDK
+# for the real provider, and it is OPTIONAL: app/llm.py imports it lazily and
+# defaults to an offline deterministic provider, so the CLI and the whole test
+# suite run without it and without an API key.
+#
+# Install it only if you want real generation:
+#     pip install anthropic==1.0.0
+# anthropic==1.0.0
+#
+# LangChain is likewise optional. app/llm.py ships a LangChainProvider adapter
+# that wraps any LangChain chat model, but nothing imports langchain unless you
+# choose to use it:
+#     pip install langchain-core langchain-anthropic
+
 # Development / testing
 pytest==8.3.3

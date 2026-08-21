@@ -11,6 +11,9 @@ Two subcommands:
 ``analyze`` (Phase 3)
     python -m app.main analyze --job-description data/job_descriptions/backend_engineer.txt
 
+``rag`` (Phase 4)
+    python -m app.main rag --job-description data/job_descriptions/backend_engineer.txt
+
 For backward compatibility the Phase 1 form without a subcommand still works and
 is treated as ``extract``::
 
@@ -23,16 +26,28 @@ import argparse
 import sys
 from pathlib import Path
 
-from app.candidate_analyzer import analyze_candidates_for_job
+from app.analysis_parser import AnalysisParseError
+from app.candidate_analyzer import analyze_candidates_for_job, analyze_job_description
+from app.chunker import ChunkingError
 from app.embeddings import DEFAULT_MODEL_NAME, EmbeddingError, get_default_embedder
+from app.llm import LLMError, get_llm_provider
 from app.matching import (
     CandidateMatcher,
     MatchingError,
     load_candidates_from_directory,
     validate_job_description,
 )
-from app.models import CandidateProfile, InvalidCandidateError, JobRequirements, MatchResult
+from app.models import (
+    CandidateAnalysis,
+    CandidateProfile,
+    InvalidCandidateError,
+    JobRequirements,
+    MatchResult,
+)
+from app.rag_context import ContextIsolationError
+from app.rag_pipeline import RagConfig, RagPipeline
 from app.resume_parser import ResumeParserError, extract_text_from_pdf
+from app.retriever import RetrievalError
 from app.skill_taxonomy import TaxonomyError
 from app.vector_store import VectorStoreError
 
@@ -40,7 +55,10 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 
 DEFAULT_RESUME_DIR = Path("data/resumes")
-SUBCOMMANDS = ("extract", "match", "analyze")
+# An instance, not the class: RagConfig uses slots, so class attribute access
+# yields the slot descriptor rather than the default value.
+RAG_DEFAULTS = RagConfig()
+SUBCOMMANDS = ("extract", "match", "analyze", "rag")
 
 # Errors that represent a normal user mistake: report the message, never a traceback.
 USER_ERRORS = (
@@ -50,6 +68,11 @@ USER_ERRORS = (
     MatchingError,
     InvalidCandidateError,
     TaxonomyError,
+    LLMError,
+    AnalysisParseError,
+    ChunkingError,
+    RetrievalError,
+    ContextIsolationError,
     FileNotFoundError,
 )
 
@@ -103,6 +126,59 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-extra-skills",
         action="store_true",
         help="Also list candidate skills the job description did not ask for.",
+    )
+
+    rag = subparsers.add_parser(
+        "rag",
+        help="LLM analysis grounded in retrieved resume evidence (Phase 4).",
+        description=(
+            "Chunk and index resumes, retrieve the passages relevant to the job "
+            "description, and ask an LLM to analyse each candidate using only that "
+            "evidence. Uses the offline deterministic provider unless LLM_PROVIDER "
+            "says otherwise, so it runs without an API key."
+        ),
+    )
+    _add_job_arguments(rag)
+    rag.add_argument(
+        "--llm-provider",
+        type=str,
+        default=None,
+        help="Override LLM_PROVIDER for this run (fake or anthropic).",
+    )
+    rag.add_argument(
+        "--llm-model",
+        type=str,
+        default=None,
+        help="Override LLM_MODEL for this run.",
+    )
+    rag.add_argument(
+        "--candidate",
+        type=str,
+        default=None,
+        help="Analyse only this candidate id (the resume file stem).",
+    )
+    rag.add_argument(
+        "--chunk-size",
+        type=int,
+        default=RAG_DEFAULTS.chunk_size,
+        help=f"Words per resume chunk (default: {RAG_DEFAULTS.chunk_size}).",
+    )
+    rag.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=RAG_DEFAULTS.chunk_overlap,
+        help=f"Words shared between chunks (default: {RAG_DEFAULTS.chunk_overlap}).",
+    )
+    rag.add_argument(
+        "--evidence-k",
+        type=int,
+        default=RAG_DEFAULTS.top_k,
+        help=f"Resume passages given to the model (default: {RAG_DEFAULTS.top_k}).",
+    )
+    rag.add_argument(
+        "--hide-evidence",
+        action="store_true",
+        help="Omit the supporting passages from the report.",
     )
 
     return parser
@@ -348,6 +424,121 @@ def format_analysis(
     return "\n".join(lines)
 
 
+def format_candidate_analysis(
+    analysis: CandidateAnalysis,
+    show_evidence: bool = True,
+) -> str:
+    """Render one LLM candidate analysis as a readable block.
+
+    Args:
+        analysis: The grounded analysis to render.
+        show_evidence: Whether to include the supporting resume passages.
+
+    Returns:
+        The formatted block, without a trailing newline.
+    """
+    lines = [
+        f"Candidate: {analysis.display_name}",
+        f"Recommendation: {analysis.recommendation.value}",
+        "",
+        "Summary:",
+        f"  {analysis.summary}",
+        "",
+    ]
+
+    def skill_block(title: str, skills: tuple[str, ...]) -> list[str]:
+        if not skills:
+            return [f"{title}: none"]
+        return [f"{title}:", *(f"  - {skill}" for skill in skills)]
+
+    lines.extend(skill_block("Matched Skills", analysis.matched_skills))
+    lines.append("")
+    lines.extend(skill_block("Skill Gaps", analysis.skill_gaps))
+    lines.extend(["", "Experience:", f"  {analysis.experience_assessment}"])
+
+    if show_evidence:
+        lines.extend(["", "Evidence (verbatim resume passages given to the model):"])
+        if not analysis.evidence:
+            lines.append("  none retrieved")
+        for item in analysis.evidence:
+            excerpt = " ".join(getattr(item, "text", str(item)).split())
+            if len(excerpt) > 220:
+                excerpt = excerpt[:220].rstrip() + " ..."
+            chunk_id = getattr(item, "chunk_id", "?")
+            score = getattr(item, "retrieval_score", None)
+            score_text = "" if score is None else f", similarity={score:.4f}"
+            lines.append(f"  - [{chunk_id}{score_text}]")
+            lines.append(f"    {excerpt}")
+
+    if analysis.limitations:
+        lines.append("")
+        lines.append("Limitations:")
+        lines.extend(f"  - {item}" for item in analysis.limitations)
+
+    if analysis.warnings:
+        lines.append("")
+        lines.append("Grounding warnings (unsupported claims corrected during validation):")
+        lines.extend(f"  ! {item}" for item in analysis.warnings)
+
+    return "\n".join(lines)
+
+
+def format_rag_report(
+    requirements: JobRequirements,
+    analyses: list[CandidateAnalysis],
+    model_name: str,
+    show_evidence: bool = True,
+) -> str:
+    """Render the full Phase 4 report.
+
+    Args:
+        requirements: Structured job requirements.
+        analyses: Candidate analyses, best match first.
+        model_name: Provider and model that produced the analyses.
+        show_evidence: Whether to include supporting passages.
+
+    Returns:
+        The formatted report.
+    """
+    required = ", ".join(requirements.required_skills) or "none recognised"
+    minimum = (
+        "not stated"
+        if requirements.minimum_experience is None
+        else f"{requirements.minimum_experience:g} years"
+    )
+
+    lines = [
+        "JOB REQUIREMENTS",
+        f"  Required Skills: {required}",
+        f"  Minimum Experience: {minimum}",
+        "",
+        f"LLM: {model_name}",
+        "",
+        "=" * 72,
+    ]
+
+    if not analyses:
+        lines.append("No candidates analysed.")
+    else:
+        for analysis in analyses:
+            lines.append("")
+            lines.append(format_candidate_analysis(analysis, show_evidence=show_evidence))
+            lines.append("")
+            lines.append("-" * 72)
+
+    lines.extend(
+        [
+            "",
+            "Each analysis is generated from the job description, the deterministic",
+            "candidate profile, and the retrieved passages shown above -- nothing else.",
+            "Claims are checked against the profile after generation and unsupported ones",
+            "are removed, but this reduces hallucination rather than eliminating it.",
+            "Read the evidence before acting on any conclusion.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def run_extract(args: argparse.Namespace) -> int:
     """Run the ``extract`` subcommand.
 
@@ -418,6 +609,59 @@ def run_analyze(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def run_rag(args: argparse.Namespace) -> int:
+    """Run the ``rag`` subcommand.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        :data:`EXIT_OK` on success.
+
+    Raises:
+        FileNotFoundError: If the resume directory or job-description file is missing.
+        app.llm.LLMError: If the provider is misconfigured or the call fails.
+    """
+    job_description, candidates = _prepare_job_and_resumes(args)
+
+    provider = get_llm_provider(provider=args.llm_provider, model=args.llm_model)
+    config = RagConfig(
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
+        top_k=args.evidence_k,
+    )
+    pipeline = RagPipeline(
+        embedder=get_default_embedder(args.model),
+        llm=provider,
+        config=config,
+    )
+
+    chunk_count = pipeline.index_candidates(candidates)
+    print(
+        f"Indexed {chunk_count} chunk(s) from {len(candidates)} resume(s); "
+        f"generating with {provider.name} ...",
+        file=sys.stderr,
+    )
+
+    if args.candidate:
+        requirements = analyze_job_description(job_description)
+        analyses = [pipeline.analyze_candidate(args.candidate, requirements)]
+    else:
+        requirements, analyses = pipeline.analyze_all(
+            job_description, top_k_candidates=args.top_k
+        )
+
+    print(
+        format_rag_report(
+            requirements,
+            analyses,
+            model_name=provider.name,
+            show_evidence=not args.hide_evidence,
+        )
+    )
+    return EXIT_OK
+
+
 def _prepare_job_and_resumes(args: argparse.Namespace) -> tuple[str, list]:
     """Read the job description and load the resume folder, with user-facing warnings.
 
@@ -467,7 +711,12 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(_normalize_argv(raw))
 
-    handlers = {"extract": run_extract, "match": run_match, "analyze": run_analyze}
+    handlers = {
+        "extract": run_extract,
+        "match": run_match,
+        "analyze": run_analyze,
+        "rag": run_rag,
+    }
 
     try:
         return handlers[args.command](args)
