@@ -42,6 +42,9 @@ htmlcov/
 Thumbs.db
 desktop.ini
 
+# Runtime state written by start_app.ps1 (pids, ports, service logs)
+.run/
+
 # Generated / temporary output
 *.log
 *.tmp

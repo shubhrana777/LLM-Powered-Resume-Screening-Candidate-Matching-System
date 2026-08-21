@@ -1,8 +1,66 @@
-"""Lightweight typed records shared across the matching pipeline.
+"""The records every layer of the system passes around.
 
-Plain frozen dataclasses are enough here. There is no validation framework and
-no ORM: a candidate is text plus an identifier, and a match result is that
-identifier plus a score.
+Plain frozen dataclasses. There is no validation framework and no ORM: a
+candidate is text plus an identifier, and a match result is that identifier
+plus a score.
+
+What each record is
+-------------------
+====================== =====================================================
+:class:`Candidate`     One person's resume: id, text, name, source file.
+:class:`JobRequirements`  A job description, plus the skills and minimum
+                       experience read out of it.
+:class:`MatchResult`   One candidate's position in a ranking (Phase 2).
+:class:`SkillComparison`  Required skills split into matched / missing /
+                       additional (Phase 3).
+:class:`CandidateProfile` Everything the deterministic extractors found about
+                       one candidate, optionally joined to their ranking.
+:class:`CandidateAnalysis` The LLM's reading of one candidate, after it has
+                       been validated against their profile (Phase 4).
+:class:`EducationEntry` One degree found on a resume.
+:class:`Recommendation` The controlled vocabulary an analysis may conclude with.
+====================== =====================================================
+
+The four measures, and why they are not interchangeable
+-------------------------------------------------------
+A candidate ends up carrying four numbers or labels. They come from different
+places, mean different things, and regularly disagree with each other. Treating
+any one as a stand-in for another is the most damaging mistake this codebase
+could make, so each is named separately and never derived from the others.
+
+``semantic_match_score`` -- **similarity**
+    Cosine similarity between the job-description embedding and the whole
+    resume embedding. *Raw model output*: an embedding-space distance, computed
+    by :mod:`app.matching`. It reflects how alike two documents read, which is
+    a useful way to order a pile of resumes and nothing more. It is not a
+    probability, not a percentage of requirements met, and comparable only
+    within a single ranking. The UI renders it as a percentage of the cosine
+    scale for readability; the stored value is untouched.
+
+``matched_skills`` / ``missing_skills`` -- **skill coverage**
+    A count, not a score: how many of the skills named in the job description
+    appear on the resume. *Derived deterministically* by
+    :mod:`app.skill_extractor` from a fixed taxonomy. Exact, explainable, and
+    blind to any skill the taxonomy does not know. A candidate can read as
+    highly similar and still cover few required skills; that disagreement is
+    information, not an error.
+
+``meets_experience_requirement`` -- **experience**
+    A three-way comparison: ``True``, ``False``, or ``None`` when either the
+    resume or the job description does not state a figure. *Derived
+    deterministically* by :mod:`app.candidate_analyzer`. Unknown is never
+    resolved into a pass or a fail.
+
+``recommendation`` -- **assessment**
+    A coarse ordinal label from :class:`Recommendation`. *LLM-generated*, then
+    checked against the deterministic profile by :mod:`app.analysis_parser` and
+    replaced with ``INSUFFICIENT_INFORMATION`` if it cannot be trusted. It is
+    not a score, not a ranking key, and never a hiring decision.
+
+Provenance, in one line each: **similarity** is measured, **coverage** and
+**experience** are extracted, **recommendation** is generated and then
+validated. Only the last one can be wrong in an interesting way, which is why
+:class:`CandidateAnalysis` carries the evidence it was based on.
 """
 
 from __future__ import annotations
@@ -181,17 +239,22 @@ class CandidateProfile:
             resume, otherwise ``None``. Never inferred from dates or graduation
             years.
         education: Education entries found, possibly empty.
-        matched_skills: Required skills the candidate has.
+        matched_skills: **Skill coverage** -- required skills the candidate
+            has. Extracted deterministically, so this is a count of named
+            skills rather than a score.
         missing_skills: Required skills the candidate lacks.
         additional_skills: Candidate skills the job did not ask for.
-        semantic_match_score: Cosine similarity from Phase 2 matching, or
-            ``None`` when the profile was built without semantic matching. A
-            **semantic similarity score**, not a probability of being hired.
+        semantic_match_score: **Similarity** -- cosine similarity from Phase 2
+            matching, or ``None`` when the profile was built without semantic
+            matching. Raw model output: an embedding-space distance, not a
+            probability of being hired and not a share of requirements met.
+            Unrelated to ``matched_skills``; see the module docstring.
         rank: 1-based rank from semantic matching, when available.
         required_experience: Minimum experience the job stated, or ``None``.
-        meets_experience_requirement: ``True``/``False`` when both the
-            requirement and the candidate's experience are known, otherwise
-            ``None``. Unknown is never treated as pass or fail.
+        meets_experience_requirement: **Experience** -- ``True``/``False`` when
+            both the requirement and the candidate's experience are known,
+            otherwise ``None``. Derived deterministically, and unknown is never
+            treated as pass or fail.
         source_path: Path the resume was read from, when known.
     """
 
@@ -285,17 +348,26 @@ class CandidateAnalysis:
     Attributes:
         candidate_id: Candidate this analysis is about.
         candidate_name: Candidate name, when known.
-        summary: Short prose summary of the candidate against the role.
-        recommendation: Controlled-vocabulary label; see :class:`Recommendation`.
+        summary: **LLM-generated** prose summary of the candidate against the
+            role. The only free text here, and the only field that can be
+            subtly wrong in a way no check catches -- read ``evidence``.
+        recommendation: **Assessment** -- LLM-generated controlled-vocabulary
+            label, validated before it reaches this record. A coarse ordinal
+            label, never a score and never a hiring decision. See
+            :class:`Recommendation`.
         matched_skills: Required skills the evidence supports.
         skill_gaps: Required skills not supported by the evidence.
         experience_assessment: Prose comparison of stated experience against the
             stated requirement, or ``"Not stated"`` when the resume gives none.
-        evidence: The passages supplied to the model, retained so a reviewer can
-            check any claim against source text. Source excerpts only -- never
-            the model's internal reasoning.
+        evidence: **Source text** -- the verbatim resume passages supplied to
+            the model, retained so a reviewer can check any claim against what
+            the resume actually says. Excerpts only, never the model's internal
+            reasoning, and always scoped to this candidate alone.
         limitations: What this analysis could not determine, in the model's own
             words plus any caveats added by the parser.
+        education: Degrees found on the resume by the Phase 3 extractor, as
+            display strings. Deterministic -- extracted, never generated, and
+            never subject to the model's claims.
         model_name: Identifier of the provider/model that produced it.
         warnings: Grounding problems detected while validating the response,
             such as a claimed skill absent from the candidate profile. A
@@ -313,6 +385,7 @@ class CandidateAnalysis:
     limitations: tuple[str, ...] = ()
     model_name: str = "unknown"
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    education: tuple[str, ...] = ()
 
     @property
     def display_name(self) -> str:

@@ -316,4 +316,7 @@ def parse_candidate_analysis(
         limitations=tuple(limitations),
         model_name=model_name,
         warnings=tuple(warnings),
+        # Straight from the deterministic profile: the model is never asked
+        # about education, so there is nothing here to validate or correct.
+        education=tuple(str(entry) for entry in profile.education),
     )

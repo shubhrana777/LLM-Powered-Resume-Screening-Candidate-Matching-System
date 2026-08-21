@@ -39,8 +39,14 @@ uvicorn==0.52.4
 # needs. Not imported directly by app/.
 python-multipart==0.0.32
 
+# Phase 6 -- Streamlit dashboard
+# The dashboard is an HTTP client of the API above; it imports nothing from
+# app.api or the Phase 1-4 modules. Streamlit brings altair, pandas and numpy,
+# so the two charts and the sortable table cost no extra dependency.
+streamlit==1.62.0
+
 # Development / testing
 pytest==8.3.3
-# Transport used by fastapi.testclient.TestClient. Test-only; the server does
-# not need it.
+# HTTP transport. Used by fastapi.testclient.TestClient in the tests AND by the
+# Streamlit dashboard at runtime, so this is not test-only.
 httpx==0.28.1

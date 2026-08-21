@@ -19,7 +19,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, UploadFile, status
+from fastapi import APIRouter, File, Form, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app import __version__
@@ -103,6 +103,7 @@ def _render_analysis(analysis: CandidateAnalysis) -> AnalysisResponse:
         matched_skills=list(analysis.matched_skills),
         skill_gaps=list(analysis.skill_gaps),
         experience_assessment=analysis.experience_assessment,
+        education=list(analysis.education),
         evidence=[
             EvidenceItem(
                 candidate_id=item.candidate_id,
@@ -202,22 +203,36 @@ def health(settings: SettingsDep) -> HealthResponse:
     summary="Upload a PDF resume and extract its text",
     description=(
         "Validates and parses a PDF with the Phase 1 parser and reports what was "
-        "extracted. The file is written to a temporary location, parsed, and "
-        "deleted: it is not stored and does not join the candidate pool, which is "
-        "always the server's configured resume directory. The full text is not "
-        "returned, only its length and a short preview."
+        "extracted. The full text is not returned, only its length and a short "
+        "preview. "
+        "By default the file is written to a temporary location, parsed, and "
+        "deleted: it is **not** stored and does not join the candidate pool. Send "
+        "`store=true` to keep it -- the resume is copied into the server's resume "
+        "directory under a generated name derived from the submitted one, and "
+        "becomes rankable by `/match-candidates` and `/analyze-candidate`. "
+        "Re-uploading a file whose name reduces to the same id replaces it."
     ),
     responses={**_ERROR_RESPONSES, 413: {"model": ErrorResponse, "description": "File too large."}},
 )
-async def upload_resume(settings: SettingsDep, file: UploadFile = File(...)) -> UploadResumeResponse:
-    """Extract text from an uploaded PDF resume.
+async def upload_resume(
+    settings: SettingsDep,
+    service: ServiceDep,
+    file: UploadFile = File(..., description="The PDF resume to upload."),
+    store: bool = Form(
+        False,
+        description="Keep the resume as a rankable candidate instead of discarding it.",
+    ),
+) -> UploadResumeResponse:
+    """Extract text from an uploaded PDF resume, optionally keeping it.
 
     Args:
         settings: API configuration, for the upload size ceiling.
+        service: The shared screening service, used only when storing.
         file: The uploaded PDF.
+        store: Whether the resume should join the candidate pool.
 
     Returns:
-        Metadata about the extracted text.
+        Metadata about the extracted text, and the candidate id when stored.
 
     Raises:
         BadRequestError: If the file is missing a name, is not a PDF, or is empty.
@@ -239,21 +254,34 @@ async def upload_resume(settings: SettingsDep, file: UploadFile = File(...)) -> 
     logger.info("Upload received: %s (%s)", filename, file.content_type or "no content type")
 
     temp_path = await _stream_to_temp_file(file, settings.max_upload_bytes)
+    candidate_id: str | None = None
     try:
         text = await run_in_threadpool(extract_text_from_pdf, temp_path)
+        # Only a resume that parsed is worth keeping, so storing happens here
+        # rather than while streaming.
+        if store:
+            candidate = await run_in_threadpool(service.store_resume, temp_path, filename)
+            candidate_id = candidate.candidate_id
     except Exception as exc:
-        logger.info("Upload %s could not be parsed: %s", filename, type(exc).__name__)
+        logger.info("Upload %s could not be processed: %s", filename, type(exc).__name__)
         raise
     finally:
         temp_path.unlink(missing_ok=True)
 
-    logger.info("Upload %s parsed: %d characters extracted", filename, len(text))
+    logger.info(
+        "Upload %s parsed: %d characters extracted, stored=%s",
+        filename,
+        len(text),
+        bool(candidate_id),
+    )
 
     return UploadResumeResponse(
         filename=filename,
         text_length=len(text),
         word_count=len(text.split()),
         preview=text[:PREVIEW_CHARS],
+        stored=candidate_id is not None,
+        candidate_id=candidate_id,
     )
 
 

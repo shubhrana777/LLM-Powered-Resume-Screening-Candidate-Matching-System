@@ -1,7 +1,7 @@
 # LLM-Powered Resume Screening & Candidate Matching System
 
 A system that ranks candidates against a job description. It is built in phases;
-**Phases 1 to 5 are complete**.
+**Phases 1 to 6 are complete**.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
@@ -10,10 +10,142 @@ A system that ranks candidates against a job description. It is built in phases;
 | 3 | Skill extraction and candidate analysis | Done |
 | 4 | LLM analysis grounded in retrieved evidence (RAG) | Done |
 | 5 | FastAPI REST backend | Done |
-| 6+ | Streamlit dashboard, Docker | Not started |
+| 6 | Streamlit recruiter dashboard | Done |
+| 7+ | Docker, production polish | Not started |
 
-Explicitly **not** implemented yet: Streamlit, Docker, databases,
-authentication, deployment, and OCR for scanned PDFs.
+Explicitly **not** implemented yet: Docker, databases, authentication,
+deployment, and OCR for scanned PDFs.
+
+## Quick start
+
+```powershell
+pip install -r requirements.txt
+python scripts/generate_sample_data.py   # fictional sample resumes
+.\start_app.ps1                          # starts the API and the dashboard
+```
+
+| | |
+| --- | --- |
+| Dashboard | <http://localhost:8501> |
+| API | <http://127.0.0.1:8000> |
+| API docs | <http://127.0.0.1:8000/docs> |
+
+`.\stop_app.ps1` stops both. On macOS or Linux, or to run them separately,
+see [Running the two services](#running-the-two-services).
+
+No API key is needed: the LLM provider defaults to an offline deterministic
+one. See *Configuration* to point it at a real model.
+
+## Architecture
+
+Eight stages, each owned by one module. Nothing below re-implements anything
+above it.
+
+### 1. Ingestion
+PDF resumes are parsed into clean text. `resume_parser.py`
+
+### 2. Ranking
+The job description and every resume are embedded and compared by cosine
+similarity, with FAISS doing the search. This orders the pile; it decides
+nothing. `embeddings.py`, `vector_store.py`, `matching.py`
+
+### 3. Candidate analysis
+Skills, years of experience and degrees are extracted by deterministic rules
+against a fixed taxonomy — no model involved, so the result is exact and
+explainable. `skill_taxonomy.py`, `skill_extractor.py`,
+`experience_extractor.py`, `education_extractor.py`, `candidate_analyzer.py`
+
+### 4. Grounded retrieval
+The selected candidate's resume is split into overlapping chunks, each indexed
+in that candidate's **own** FAISS index, and the passages closest to the job
+requirements are retrieved. One index per candidate is what makes cross-
+contamination structurally impossible rather than a filter that could have a
+bug. `chunker.py`, `retriever.py`
+
+### 5. LLM analysis
+The job description, the deterministic profile and the retrieved passages —
+and nothing else — are assembled into a prompt. The model sees only material
+that came from this candidate. `rag_context.py`, `prompts.py`, `llm.py`
+
+### 6. Validation
+The response is parsed and checked against the deterministic profile. Skills
+the resume does not support are removed, invented durations and degrees are
+flagged, and a recommendation outside the vocabulary becomes
+`INSUFFICIENT_INFORMATION`. Every correction is recorded in `warnings`.
+`analysis_parser.py`, orchestrated by `rag_pipeline.py`
+
+### 7. API
+FastAPI exposes the whole thing over HTTP, holding the parsed pool and its
+indexes in memory so they are built once rather than per request. `app/api/`
+
+### 8. UI
+Streamlit provides the recruiter dashboard. It is a pure client: it talks to
+the API over HTTP and imports nothing from the layers above. `app/ui/`
+
+### The pipeline
+
+```mermaid
+flowchart TD
+    JD[Job description] --> EMB[Embedding]
+    PDF[PDF resumes] --> TXT[Resume text]
+    TXT --> EMB
+    EMB --> RANK[Candidate ranking<br/>cosine similarity]
+    RANK --> PICK[Select top candidates]
+    PICK --> EXTRACT[Skill / experience / education extraction<br/>deterministic]
+    PICK --> CHUNKS[Resume chunk retrieval<br/>scoped to one candidate]
+    EXTRACT --> CTX[Grounded context]
+    CHUNKS --> CTX
+    CTX --> LLM[LLM]
+    LLM --> VALID[Validation against the profile]
+    EXTRACT --> VALID
+    VALID --> UI[Recruiter dashboard]
+```
+
+Everything left of `LLM` is deterministic: the same resume and the same job
+description always produce the same skills, the same experience verdict and the
+same retrieved passages. Only the summary and the recommendation are generated,
+and both are checked before they are shown.
+
+### Request path
+
+```mermaid
+flowchart LR
+    B[Browser] --> S[Streamlit UI]
+    S -->|HTTP| F[FastAPI]
+    F --> SV[Screening service<br/>cached pool + indexes]
+    SV --> M[Matching]
+    SV --> A[Analysis]
+    SV --> R[RAG]
+    M --> D[(Resume data)]
+    A --> D
+    R --> D
+```
+
+The dashboard never reads a resume from disk, never loads a model, and never
+imports `app.api.service` or any Phase 1–4 module — a test enforces that. Point
+`API_BASE_URL` elsewhere and the same dashboard drives a backend on another
+machine.
+
+### The four measures
+
+A candidate ends up with four figures. They come from different places and
+regularly disagree; that disagreement is information, not a bug.
+
+| | What it is | Where it comes from | Shown as |
+| --- | --- | --- | --- |
+| **Semantic similarity** | How alike the resume and the job description read in embedding space | Measured — cosine similarity | `59.35%` |
+| **Skill coverage** | How many named requirements the resume actually mentions | Extracted — deterministic, from a fixed taxonomy | `11 / 12` |
+| **Experience** | Whether stated years meet stated years | Extracted — three-way, unknown stays unknown | `Requirement met` |
+| **Recommendation** | A coarse ordinal assessment | Generated by the LLM, then validated | `Strong match` |
+
+**similarity ≠ skill coverage ≠ recommendation.** A candidate can read as very
+similar and cover few requirements — that usually means the resume is written in
+the same register as the job description without containing the substance. The
+dashboard shows all four side by side for exactly that reason.
+
+The percentage on similarity is a readability convention for a value that runs
+0–1, not a probability. The stored and API-returned value is the raw cosine
+number, unchanged.
 
 ## Phase 1 scope — resume parsing
 
@@ -60,6 +192,15 @@ All Phase 3 extraction is deterministic string matching. No model is involved.
 - Serve generated OpenAPI/Swagger documentation.
 - Keep the CLI working unchanged.
 
+## Phase 6 scope — recruiter dashboard
+
+- A Streamlit front end that talks to the API over HTTP and nothing else.
+- Job description input, multi-file PDF upload, ranking, candidate detail.
+- Matched skills, gaps, experience, education, AI summary and evidence.
+- Filtering, sorting and two charts that answer real questions.
+- Loading, empty, success, error and API-unavailable states throughout.
+- A design system and accessibility pass from the `ui-ux-pro-max` skill.
+
 ## Project structure
 
 ```
@@ -93,6 +234,15 @@ resume-screening-ai/
 │       ├── dependencies.py  #   shared FastAPI dependencies
 │       ├── config.py        #   settings read from the environment
 │       └── errors.py        #   consistent error responses
+│   └── ui/                  # Phase 6: Streamlit dashboard (an API client)
+│       ├── dashboard.py     #   entry point: streamlit run app/ui/dashboard.py
+│       ├── pages.py         #   the four screens
+│       ├── components.py    #   badges, cards, evidence blocks, charts, states
+│       ├── api_client.py    #   the only module that speaks HTTP
+│       ├── formatting.py    #   pure display helpers
+│       ├── state.py         #   session state and invalidation
+│       ├── theme.py         #   design tokens + stylesheet
+│       └── config.py        #   settings from the environment
 │
 ├── data/
 │   ├── resumes/             # Put your PDFs here (git-ignored)
@@ -127,9 +277,19 @@ resume-screening-ai/
 │   ├── test_api_upload.py
 │   ├── test_api_errors.py
 │   ├── test_api_service.py
+│   ├── test_api_upload_store.py
+│   ├── test_ui_api_client.py
+│   ├── test_ui_formatting.py
+│   ├── test_ui_state.py
+│   ├── test_ui_app.py       # renders the real app via Streamlit AppTest
 │   ├── test_integration.py
 │   └── test_integration_phase3.py
 │
+├── .streamlit/
+│   └── config.toml          # Streamlit base theme
+├── .run/                    # pids + service logs (git-ignored)
+├── start_app.ps1            # start API + dashboard
+├── stop_app.ps1             # stop only what start_app started
 ├── .gitignore
 ├── .env.example
 ├── pytest.ini
@@ -1060,6 +1220,189 @@ so FastAPI runs them in a worker thread instead of stalling the event loop.
   locally, and do not expose it to an untrusted network or upload real candidate
   data to a deployment you do not control.
 
+## Phase 6 — the recruiter dashboard
+
+A Streamlit front end over the Phase 5 API. It is a **client**: every number it
+shows arrived over HTTP, and it imports nothing from `app.api` or from the
+Phase 1–4 modules. A test asserts that.
+
+### Running the two services
+
+On Windows, one command starts both:
+
+```powershell
+.\start_app.ps1              # or: .\start_app.ps1 -ApiPort 8100 -UiPort 8600
+.\stop_app.ps1
+```
+
+`start_app.ps1` finds a usable Python (`$env:PYTHON`, an active virtualenv, a
+project `.venv`, then `python` on PATH — no path is hardcoded), checks the
+required packages are installed, starts both services, waits for each to answer
+a health check, and prints the URLs. Running it twice is safe: a service that is
+already up is reported and left alone.
+
+`stop_app.ps1` stops **only** the processes `start_app.ps1` started. It records
+each process id together with its start time in `.run/`, verifies both before
+stopping anything — Windows reuses process ids — and stops child processes
+first, because `uvicorn --reload` runs the application in a child that would
+otherwise be orphaned holding the port. It never matches processes by name, so
+it cannot touch another project's Python. It is safe to run when nothing is
+running.
+
+`.run/` holds the pids and the service logs, and is git-ignored.
+
+Or run them by hand, in two terminals, backend first:
+
+```bash
+uvicorn app.api.main:app --reload      # terminal 1
+streamlit run app/ui/dashboard.py      # terminal 2
+```
+
+Then open <http://localhost:8501>. If the API is somewhere else, point the
+dashboard at it:
+
+```bash
+API_BASE_URL=http://192.168.1.20:8000 streamlit run app/ui/dashboard.py
+```
+
+The dashboard needs no filesystem access of its own — no resume directory, no
+model, no key. If the API is not running it says so and shows how to start it,
+rather than displaying a screen of zeroes.
+
+### The workflow
+
+```
+Overview ──► Screening ──────────────────► Ranking ──► Candidate
+             1. paste job description      table       skills · gaps
+             2. upload PDF resumes         charts      experience · education
+             3. rank the pool              filters     AI summary · evidence
+```
+
+**Overview** — what this session holds: candidates loaded, candidates analysed,
+strong matches, mean similarity, and where you are in the three steps. Figures
+that do not exist yet read *Not analyzed yet*, never `0`.
+
+**Screening** — paste the job description, upload one or more PDFs, then rank.
+Uploads go through `POST /upload-resume` with `store=true`, so they join the
+pool and become rankable. Accepted and rejected files are listed separately with
+the reason for each rejection.
+
+**Ranking** — the ranked table with search, a recommendation filter, a minimum
+similarity slider, and four sort orders. A horizontal bar chart shows how far
+ahead the leader is; a stacked bar shows matched-versus-missing skills for
+anyone analysed. Skill coverage, experience and recommendation come from an
+analysis, which costs a model call, so they fill in only for candidates you
+choose to analyse — everyone else reads *Not analyzed yet*, with a hint
+explaining what analysis would add. Ranking and analysis are separate
+operations, and the label says so rather than implying a failure.
+
+**Candidate** — the full picture for one person: similarity, recommendation,
+grounding status, matched skills, gaps, experience, education, the AI summary,
+and the retrieved evidence.
+
+Changing the job description clears the ranking and every analysis. They were
+produced for a different role, and leaving them on screen under a new heading
+would be quietly wrong.
+
+### Evidence is never mistaken for interpretation
+
+The detail view renders the two in visibly different containers: retrieved
+resume text is monospace on a tinted ground behind a solid rule and labelled
+*From resume · chunk id · similarity*; the model's prose sits on a white card
+behind a dashed rule labelled *AI-generated interpretation*, with the model name
+underneath. A recruiter should never have to work out which half of the page the
+resume actually said.
+
+### What the numbers are allowed to say
+
+The dashboard inherits the backend's rules and does not soften them:
+
+* A similarity score is shown as a percentage of the cosine scale — `0.5935`
+  reads as `59.35%` — because that is far easier to scan than four decimals.
+  The percent sign is a readability convention for a value that runs 0–1, and
+  the sentence beside it says so outright: *"Semantic similarity between the job
+  description and candidate resume embeddings. This is a ranking signal, not a
+  hiring probability or percentage of requirements met."* The candidate detail
+  view also shows the raw cosine value, so the backend number is never hidden.
+  **The API response and every stored value are unchanged** — this is
+  presentation only.
+* Alongside the figure is a word — *Strong / Moderate / Low similarity* — so the
+  reading never depends on colour.
+* Skill coverage stays a count — `11 / 12`, never a percentage — so it cannot be
+  mistaken for the similarity figure beside it.
+* A recommendation is shown as a label with its "coarse ordinal, not a score"
+  caveat attached.
+* Unknown is never rendered as zero, a pass or a failure.
+
+### Design
+
+The visual system is the output of the `ui-ux-pro-max` skill, which returns
+**Minimalism & Swiss Style** for this product type — twice, for "recruitment
+hiring dashboard" and for "enterprise hr analytics admin dashboard" — noting its
+best fit as "enterprise apps, dashboards, professional tools". Its colour
+strategy for that pattern is a *neutral* canvas with status colours, not blue
+everywhere:
+
+* neutrals sit on a slate ramp and carry the canvas, cards, borders and text;
+* **blue is reserved** for primary actions, the active nav item, links, focus
+  rings and the top-match rule — nothing decorative is blue;
+* **status is green / amber / red**, and always paired with a word.
+
+Type is Inter for text and Fira Code for every figure, so numbers are tabular
+and columns do not jitter. Elevation uses the first two levels of the skill's
+four-level scale; a professional tool wants edges and restraint, not depth.
+
+`.streamlit/config.toml` carries the base theme for Streamlit's own widgets;
+`app/ui/theme.py` holds the same tokens as CSS for everything Streamlit has no
+theme option for. Neither file repeats a colour the other defines.
+
+Two of the skill's colours are used differently from how it returned them. Its
+own accessibility rule requires 4.5:1 for body text, and the accent green reaches
+about 3.1:1 on white, so text uses a darker variant while the original stays for
+fills, borders and chart marks, where the 3:1 non-text threshold applies. The
+skill's rule wins over the skill's swatch.
+
+Accessibility, following the same skill's checklist: every status carries a word
+as well as a colour, skill gaps are dashed as well as red, focus rings are
+strengthened rather than removed, `prefers-reduced-motion` is respected, long
+names wrap instead of truncating, figures use tabular numerals, and each chart
+has the sortable table beside it as its text equivalent.
+
+Charts are limited to the two that answer questions a table hides — how far ahead
+the leader is, and who covers the requirements. There is no decorative chart, and
+no score-distribution histogram: with a handful of candidates it would suggest a
+distribution that is not there.
+
+### Structure
+
+```
+app/ui/
+├── dashboard.py    # entry point: page config, theme, sidebar, dispatch
+├── pages.py        # the four screens
+├── components.py   # badges, chips, cards, evidence blocks, charts, states
+├── api_client.py   # the only module that speaks HTTP
+├── formatting.py   # pure display helpers (bands, labels, coverage)
+├── state.py        # session state and its invalidation rules
+├── theme.py        # design tokens and the stylesheet built from them
+└── config.py       # settings from the environment
+```
+
+The entry point is `dashboard.py`, not `app.py`: a Streamlit script named
+`app.py` registers a top-level module `app` that shadows this project's `app`
+package outright, and no `sys.path` ordering undoes that.
+
+### Configuration
+
+| Variable | Meaning |
+| --- | --- |
+| `API_BASE_URL` | Backend root. Default `http://127.0.0.1:8000` |
+| `API_TIMEOUT_SECONDS` | Health, listing, upload and matching. Default 30 |
+| `API_ANALYSIS_TIMEOUT_SECONDS` | Analysis, which calls a model. Default 180 |
+| `UI_DEFAULT_TOP_K` | Candidates the ranking asks for. Default 10 |
+
+Unparsable values fall back to these defaults rather than raising, so a typo
+cannot stop the dashboard from starting with no way to see why.
+
 ## Using the engine as a library
 
 ```python
@@ -1090,6 +1433,7 @@ ml_role = matcher.match("NLP engineer, PyTorch and embeddings")
 ```bash
 pytest                       # everything that runs offline
 pytest tests/test_api_*.py   # just the REST API suites
+pytest tests/test_ui_*.py    # just the dashboard suites
 pytest -m "not model"        # skip even the embedding-model tests
 pytest -m model              # only tests using real embedding weights
 pytest -m llm                # only tests calling a real LLM (needs credentials)
@@ -1114,6 +1458,12 @@ The API suites use FastAPI's `TestClient` against an app whose service
 dependency is overridden to point at a temporary resume directory, the offline
 embedder and the offline LLM provider. No API test downloads model weights,
 touches `data/resumes/`, opens a socket, or needs a key.
+
+The dashboard suites do the same one layer up. `test_ui_api_client.py` serves
+responses through an `httpx` mock transport, and `test_ui_app.py` runs the real
+Streamlit script through `AppTest` with the API client replaced by a stub — so
+every screen a recruiter can reach is actually rendered, including the empty,
+error and API-unavailable ones. No browser, no server, no model.
 
 Test PDFs are generated at runtime with PyMuPDF, so no binary fixtures are
 committed. The Phase 3 suites need neither a model nor a network: skill,
@@ -1253,6 +1603,29 @@ reported as unknown.
   resumes for a human reviewer. Embedding similarity reflects patterns in the
   model's training data and can carry those biases; an LLM summary can carry
   them too.
+
+### Recruiter dashboard (Phase 6)
+
+- **One shared pool, no sessions.** Every dashboard user uploads into the same
+  server-side resume directory and sees the same candidates. There is no
+  per-recruiter workspace, so two people screening different roles at once will
+  see each other's uploads.
+- **Uploads accumulate.** There is no delete: a resume added to the pool stays
+  until it is removed from the directory by hand. A demo pool fills up quickly.
+- **A re-upload replaces.** Two different people whose file names reduce to the
+  same id — `sarah_wilson.pdf` and `Sarah Wilson.pdf` — become one candidate,
+  and the second overwrites the first.
+- **Analyses live in the browser session.** Reloading the tab loses them and
+  they must be paid for again. Nothing is persisted.
+- **Analysis is synchronous.** Analysing the top ten holds the connection for
+  ten model calls in a row, with a progress bar and no way to cancel.
+- **Experience status is read from the backend's prose.** The wording is fixed
+  today, so this is reliable; if it changed, the dashboard would fall back to
+  "Not stated" rather than guessing — but the column would stop being useful.
+- **Streamlit reruns the whole script per interaction.** With a large pool the
+  `GET /candidates` call on every rerun is the cost that will show first.
+- **Desktop-first.** Streamlit's columns reflow on narrow screens, but the
+  ranking table and charts assume a desktop window.
 
 ### REST API (Phase 5)
 

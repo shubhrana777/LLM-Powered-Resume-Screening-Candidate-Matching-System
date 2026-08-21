@@ -1,0 +1,31 @@
+# Streamlit base theme.
+#
+# The palette is the ui-ux-pro-max design system for this product type:
+# Minimalism & Swiss Style, whose colour strategy for an enterprise dashboard is
+# a neutral canvas with status colours -- not blue everywhere. Blue is the
+# single accent, reserved for primary actions and the active nav item.
+#
+# These values style Streamlit's own widgets. Everything Streamlit has no theme
+# option for -- cards, badges, evidence blocks, the step indicator -- is defined
+# as CSS in app/ui/theme.py from the same tokens, so the two cannot drift.
+
+[theme]
+base = "light"
+primaryColor = "#0369A1"
+backgroundColor = "#F6F8FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F172A"
+linkColor = "#075985"
+borderColor = "#E2E8F0"
+font = "sans-serif"
+baseRadius = "medium"
+
+[server]
+# The dashboard forwards resumes to the API rather than keeping them, but the
+# uploader still buffers each file in memory. 10 MB leaves headroom over the
+# API's own 5 MB per-file ceiling, so the API is what rejects an oversized
+# upload -- with a message the recruiter can act on.
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
