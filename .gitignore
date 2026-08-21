@@ -51,3 +51,6 @@ output/
 # Real resumes must never be committed (keep the folder, ignore its contents)
 data/resumes/*
 !data/resumes/.gitkeep
+
+# Claude Code local skills
+.claude/

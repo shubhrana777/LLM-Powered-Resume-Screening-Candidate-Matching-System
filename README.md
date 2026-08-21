@@ -1,7 +1,7 @@
 # LLM-Powered Resume Screening & Candidate Matching System
 
 A system that ranks candidates against a job description. It is built in phases;
-**Phases 1 to 4 are complete**.
+**Phases 1 to 5 are complete**.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
@@ -9,9 +9,10 @@ A system that ranks candidates against a job description. It is built in phases;
 | 2 | Semantic matching with embeddings and FAISS | Done |
 | 3 | Skill extraction and candidate analysis | Done |
 | 4 | LLM analysis grounded in retrieved evidence (RAG) | Done |
-| 5+ | REST API, dashboard, Docker | Not started |
+| 5 | FastAPI REST backend | Done |
+| 6+ | Streamlit dashboard, Docker | Not started |
 
-Explicitly **not** implemented yet: FastAPI, Streamlit, Docker, databases,
+Explicitly **not** implemented yet: Streamlit, Docker, databases,
 authentication, deployment, and OCR for scanned PDFs.
 
 ## Phase 1 scope — resume parsing
@@ -50,6 +51,15 @@ All Phase 3 extraction is deterministic string matching. No model is involved.
 - Validate every claim against the deterministic profile and correct it.
 - Keep the supporting evidence attached to the analysis.
 
+## Phase 5 scope — REST API
+
+- Expose the existing pipeline over HTTP with FastAPI.
+- Validate every request and response with Pydantic models.
+- Return consistent, non-leaking errors with useful status codes.
+- Parse and index resumes once, not per request.
+- Serve generated OpenAPI/Swagger documentation.
+- Keep the CLI working unchanged.
+
 ## Project structure
 
 ```
@@ -74,7 +84,15 @@ resume-screening-ai/
 │   ├── analysis_parser.py   # Phase 4: parses + validates LLM output
 │   ├── rag_pipeline.py      # Phase 4: end-to-end orchestration
 │   ├── models.py            # Typed records shared across phases
-│   └── main.py              # CLI: extract / match / analyze / rag subcommands
+│   ├── main.py              # CLI: extract / match / analyze / rag subcommands
+│   └── api/                 # Phase 5: REST layer over everything above
+│       ├── main.py          #   app factory + metadata (uvicorn entry point)
+│       ├── routes.py        #   endpoints; delegate only
+│       ├── schemas.py       #   Pydantic request/response models
+│       ├── service.py       #   cached pool, indexes and candidate lookup
+│       ├── dependencies.py  #   shared FastAPI dependencies
+│       ├── config.py        #   settings read from the environment
+│       └── errors.py        #   consistent error responses
 │
 ├── data/
 │   ├── resumes/             # Put your PDFs here (git-ignored)
@@ -102,6 +120,13 @@ resume-screening-ai/
 │   ├── test_analysis_parser.py
 │   ├── test_rag_pipeline.py
 │   ├── test_real_llm.py     # opt-in, needs credentials
+│   ├── test_api_health.py
+│   ├── test_api_candidates.py
+│   ├── test_api_matching.py
+│   ├── test_api_analysis.py
+│   ├── test_api_upload.py
+│   ├── test_api_errors.py
+│   ├── test_api_service.py
 │   ├── test_integration.py
 │   └── test_integration_phase3.py
 │
@@ -152,7 +177,8 @@ downloads the embedding model (~90 MB) into the Hugging Face cache
 
 ### 3. Optional environment file
 
-No secrets are needed yet, but the template is there for later phases:
+No secrets are needed. The template documents the resume directory, the
+embedding model, the optional LLM provider and the API settings:
 
 ```bash
 cp .env.example .env      # Windows: copy .env.example .env
@@ -833,6 +859,207 @@ several job descriptions without re-chunking or re-embedding. `analyze_all`
 ranks with the Phase 2 matcher first, then analyses in rank order — one model
 call per candidate, which is what `-k` controls.
 
+## Phase 5 — the REST API
+
+Everything above is available over HTTP. The API is a thin layer: it validates
+requests, calls the same functions the CLI calls, and renders the results. No
+parsing, ranking, extraction, retrieval or prompting is reimplemented in it.
+
+```bash
+uvicorn app.api.main:app --reload
+```
+
+Then open **<http://127.0.0.1:8000/docs>** for Swagger UI, `/redoc` for ReDoc, or
+`/openapi.json` for the raw schema.
+
+The CLI is unaffected — `python -m app.main rag -j <job.txt>` works exactly as
+before, with or without the server running.
+
+### Endpoints
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `GET` | `/health` | Liveness. Loads no model, reads no resume. |
+| `GET` | `/candidates` | Lists the resumes in the server's configured directory. |
+| `POST` | `/upload-resume` | Parses one uploaded PDF and reports what was extracted. |
+| `POST` | `/match-candidates` | Ranks the resume pool against a job description. |
+| `POST` | `/analyze-candidate` | Full RAG analysis of one candidate, with evidence. |
+
+### Examples
+
+**Health**
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+```json
+{
+  "status": "healthy",
+  "service": "resume-screening-api",
+  "version": "0.1.0",
+  "llm_provider": "fake"
+}
+```
+
+**Ranking** — the pool is the server's `RESUME_DIR`, never a path from the client.
+
+```bash
+curl -X POST http://127.0.0.1:8000/match-candidates \
+  -H "Content-Type: application/json" \
+  -d '{"job_description": "Financial analyst with 3+ years of experience. Strong Excel and SQL.", "top_k": 3}'
+```
+
+```json
+{
+  "results": [
+    {"rank": 1, "candidate": "Elena Rodriguez", "candidate_id": "elena_rodriguez", "similarity_score": 0.6024},
+    {"rank": 2, "candidate": "Sarah Wilson",    "candidate_id": "sarah_wilson",    "similarity_score": 0.5129},
+    {"rank": 3, "candidate": "James Patel",     "candidate_id": "james_patel",     "similarity_score": 0.4702}
+  ],
+  "count": 3,
+  "candidates_considered": 9,
+  "score_type": "cosine_similarity",
+  "score_note": "Cosine similarity between the job-description embedding and the resume embedding, in [-1.0, 1.0]. A semantic similarity score: not a probability of being hired, ..."
+}
+```
+
+The score is the raw cosine similarity the FAISS index returned, rounded to four
+decimals for display. Nothing is rescaled into a percentage, and `score_note`
+travels with the data so the number is hard to misread once it is out of context.
+
+**Analysis** — `candidate` accepts an id, a display name or a file name.
+
+```bash
+curl -X POST http://127.0.0.1:8000/analyze-candidate \
+  -H "Content-Type: application/json" \
+  -d '{"candidate": "sarah_wilson", "job_description": "Financial analyst with 3+ years of experience..."}'
+```
+
+```json
+{
+  "candidate": "Sarah Wilson",
+  "candidate_id": "sarah_wilson",
+  "recommendation": "STRONG_MATCH",
+  "recommendation_note": "A coarse ordinal label, not a score and not a probability. ...",
+  "summary": "Sarah Wilson matches 12 of 13 skills identified in the job description. ...",
+  "matched_skills": ["Python", "SQL", "Excel", "Power BI", "Tableau", "..."],
+  "skill_gaps": ["Investment Analysis"],
+  "experience_assessment": "The resume states 4 years (stated on resume); the job asks for 3 years. Requirement met: yes.",
+  "evidence": [
+    {
+      "candidate_id": "sarah_wilson",
+      "chunk_id": "sarah_wilson#4",
+      "text": "Python, Power BI, Tableau, budgeting, risk analysis, data analysis, ...",
+      "retrieval_score": 0.6709
+    }
+  ],
+  "limitations": [],
+  "warnings": [],
+  "is_grounded": true,
+  "model": "fake/deterministic-v1"
+}
+```
+
+`model` names what produced the analysis. `fake/deterministic-v1` is the offline
+provider, not a language model — set `LLM_PROVIDER=anthropic` and a key for real
+prose. Every Phase 4 safeguard applies unchanged over HTTP: unsupported claims
+are stripped, `warnings` records what was corrected, and `is_grounded` is `false`
+whenever anything was.
+
+**Upload**
+
+```bash
+curl -X POST http://127.0.0.1:8000/upload-resume -F "file=@data/resumes/sarah_wilson.pdf"
+```
+
+```json
+{
+  "filename": "sarah_wilson.pdf",
+  "status": "success",
+  "text_length": 1987,
+  "word_count": 269,
+  "preview": "Sarah Wilson\nSenior Financial Analyst\n..."
+}
+```
+
+The file is written to a temporary location, parsed, and deleted. It is **not**
+stored and does **not** join the candidate pool — the pool is always the server's
+own resume directory. The full text is not returned, only its size and a
+200-character preview.
+
+### Errors
+
+Every error has the same shape, whatever raised it:
+
+```json
+{"detail": "Only PDF files are supported.", "code": "unsupported_file_type"}
+```
+
+| Status | When |
+| --- | --- |
+| `400` | The file or the request content is unusable — not a PDF, corrupt, empty, no selectable text |
+| `404` | Unknown candidate, or the resume directory is missing or empty |
+| `413` | The upload exceeds `API_MAX_UPLOAD_BYTES` |
+| `422` | Pydantic rejected the request body — missing field, blank string, `top_k` out of range |
+| `500` | Unexpected server-side failure |
+| `502` | The LLM provider failed or returned something unusable |
+
+A `422` adds an `errors` array naming the offending fields. It does not echo the
+submitted text back.
+
+**Nothing internal is ever returned**: no traceback, no filesystem path (including
+the temporary upload path), no environment variable, and no 5xx exception text.
+Server-side failures are logged in full and answered with a fixed sentence. This
+is asserted in the tests, not just intended.
+
+### Configuration
+
+The API reads the same `.env` conventions as the rest of the project.
+
+| Variable | Meaning |
+| --- | --- |
+| `RESUME_DIR` | Directory the candidate pool is read from. Default `data/resumes` |
+| `EMBEDDING_MODEL` | Sentence Transformers model id |
+| `API_CORS_ORIGINS` | Comma-separated allowed origins. Default: localhost:8501 |
+| `API_MAX_UPLOAD_BYTES` | Upload ceiling. Default 5 MB |
+| `API_LOG_LEVEL` | Level for the `app` logger. Default `INFO` |
+
+`LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY` and `LLM_MAX_TOKENS` behave exactly as
+in Phase 4 and are read by `app/llm.py`; the API neither re-reads them nor reports
+whether a key is set.
+
+CORS defaults to `http://localhost:8501` — where the Phase 6 dashboard will run.
+`API_CORS_ORIGINS=*` opens it to any origin, logs a warning saying so, and is a
+development-only setting.
+
+### How requests stay cheap
+
+Resumes are parsed, embedded and chunked **once**, not per request. The service
+holds the pool, the FAISS indexes and the transformer model, and rebuilds them
+only when the resume directory changes — keyed by each file's name, size and
+modification time, so a new resume is picked up without a restart. On the bundled
+sample data, the first `/match-candidates` request takes several seconds to load
+the model and embed nine resumes; subsequent ones take about 30 ms.
+
+Route functions that do this blocking work are declared `def`, not `async def`,
+so FastAPI runs them in a worker thread instead of stalling the event loop.
+
+### Security notes
+
+- **PDF only**, checked by extension *and* leading `%PDF` bytes.
+- **Size-capped**, enforced while streaming so an oversized file is abandoned
+  rather than buffered.
+- **No path from a client is ever used.** Upload names are reduced to a bare file
+  name and never joined to a path; a candidate reference is looked up in the pool
+  and rejected outright if it contains `/` or `\`. Temporary files get generated
+  names and are deleted in a `finally` block.
+- **Nothing sensitive is logged**: endpoints, file names, sizes and outcomes —
+  never resume text, candidate details or credentials.
+- **There is no authentication.** That is out of scope for this phase. Run it
+  locally, and do not expose it to an untrusted network or upload real candidate
+  data to a deployment you do not control.
+
 ## Using the engine as a library
 
 ```python
@@ -862,6 +1089,7 @@ ml_role = matcher.match("NLP engineer, PyTorch and embeddings")
 
 ```bash
 pytest                       # everything that runs offline
+pytest tests/test_api_*.py   # just the REST API suites
 pytest -m "not model"        # skip even the embedding-model tests
 pytest -m model              # only tests using real embedding weights
 pytest -m llm                # only tests calling a real LLM (needs credentials)
@@ -881,6 +1109,11 @@ ranking assertions test real logic.
 Tests that must exercise the actual model are marked `model` and **skip
 automatically** when the weights cannot be loaded, so the suite still passes on a
 machine with no network access.
+
+The API suites use FastAPI's `TestClient` against an app whose service
+dependency is overridden to point at a temporary resume directory, the offline
+embedder and the offline LLM provider. No API test downloads model weights,
+touches `data/resumes/`, opens a socket, or needs a key.
 
 Test PDFs are generated at runtime with PyMuPDF, so no binary fixtures are
 committed. The Phase 3 suites need neither a model nor a network: skill,
@@ -1020,6 +1253,26 @@ reported as unknown.
   resumes for a human reviewer. Embedding similarity reflects patterns in the
   model's training data and can carry those biases; an LLM summary can carry
   them too.
+
+### REST API (Phase 5)
+
+- **No authentication and no rate limiting.** Anyone who can reach the port can
+  call every endpoint, including the one that costs a model call. Run it locally.
+- **Uploads are parsed and discarded.** `POST /upload-resume` reports what it
+  extracted; it does not add the resume to the candidate pool, which is always
+  the server's own `RESUME_DIR`. Uploading a resume and then matching against it
+  is a Phase 6 workflow, not something this API supports today.
+- **State is in-process.** One server holds one pool in memory. Two workers hold
+  two independent copies and each pays to build its own; there is no shared
+  cache, queue or database, which is the right trade for a portfolio project and
+  the wrong one for a real deployment.
+- **Pool changes are detected by file name, size and modification time.** An edit
+  that leaves all three unchanged would not trigger a rebuild.
+- **Analysis is synchronous.** A request holds a connection for the whole model
+  call. There is no job queue, no streaming and no progress reporting, so a slow
+  provider means a slow request.
+- **The first request after start-up is slow** — it loads the transformer model
+  and embeds the pool. Nothing is pre-warmed.
 
 ### Matching engine
 

@@ -28,5 +28,19 @@ numpy==2.5.2
 # choose to use it:
 #     pip install langchain-core langchain-anthropic
 
+# Phase 5 -- REST API
+# FastAPI is a thin layer over the modules above: it validates requests with
+# Pydantic (already installed as a FastAPI dependency), calls the existing
+# components, and serves the OpenAPI documentation.
+fastapi==0.141.1
+# ASGI server used to run the app: uvicorn app.api.main:app --reload
+uvicorn==0.52.4
+# Required by FastAPI to parse multipart/form-data, which POST /upload-resume
+# needs. Not imported directly by app/.
+python-multipart==0.0.32
+
 # Development / testing
 pytest==8.3.3
+# Transport used by fastapi.testclient.TestClient. Test-only; the server does
+# not need it.
+httpx==0.28.1

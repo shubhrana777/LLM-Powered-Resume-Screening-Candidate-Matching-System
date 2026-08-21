@@ -411,3 +411,116 @@ def isolation_embedder() -> FakeEmbedder:
     return FakeEmbedder(
         ("python", "sql", "database", "api", "kubernetes", "docker", "backend", "platform")
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 5 fixtures (REST API)
+# --------------------------------------------------------------------------
+
+# The API tests run against a temporary resume directory with an offline
+# embedder and the offline LLM provider, so no test downloads model weights,
+# touches the real data/resumes folder, or needs an API key.
+
+ANALYST_VOCABULARY = (
+    "excel",
+    "sql",
+    "python",
+    "budgeting",
+    "forecasting",
+    "financial",
+    "modeling",
+    "finance",
+    "analyst",
+    "tableau",
+    "reporting",
+    "accounting",
+    "design",
+    "graphic",
+    "photoshop",
+    "illustrator",
+    "branding",
+    "typography",
+)
+
+
+@pytest.fixture
+def analyst_embedder() -> FakeEmbedder:
+    """An offline embedder whose vocabulary separates analysts from designers."""
+    return FakeEmbedder(ANALYST_VOCABULARY)
+
+
+@pytest.fixture
+def api_settings(analyst_resume_dir: Path):
+    """API settings pointed at a temporary resume directory."""
+    from app.api.config import Settings
+
+    return Settings(resume_dir=analyst_resume_dir)
+
+
+@pytest.fixture
+def api_service(api_settings, analyst_embedder: FakeEmbedder):
+    """A screening service backed by offline components only."""
+    from app.api.service import ScreeningService
+    from app.llm import FakeLLMProvider
+
+    return ScreeningService(
+        api_settings,
+        embedder=analyst_embedder,
+        llm=FakeLLMProvider(),
+    )
+
+
+def build_test_client(settings, service, *, raise_server_exceptions: bool = True):
+    """Build a TestClient for an isolated app wired to ``service``.
+
+    Args:
+        settings: Settings the app is constructed with.
+        service: Screening service every route will receive.
+        raise_server_exceptions: Set ``False`` to observe the 500 response a
+            real client would get instead of having the exception re-raised.
+
+    Returns:
+        A configured :class:`~fastapi.testclient.TestClient`.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.api.dependencies import get_service, get_settings
+    from app.api.main import create_app
+
+    application = create_app(settings)
+    application.dependency_overrides[get_settings] = lambda: settings
+    application.dependency_overrides[get_service] = lambda: service
+
+    return TestClient(application, raise_server_exceptions=raise_server_exceptions)
+
+
+@pytest.fixture
+def api_client(api_settings, api_service):
+    """A test client for an app wired to the offline service."""
+    with build_test_client(api_settings, api_service) as client:
+        yield client
+
+
+@pytest.fixture
+def lenient_api_client(api_settings, api_service):
+    """A client that returns the 500 response instead of re-raising."""
+    with build_test_client(api_settings, api_service, raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.fixture
+def valid_pdf_bytes(valid_pdf: Path) -> bytes:
+    """The bytes of a real, parsable PDF."""
+    return valid_pdf.read_bytes()
+
+
+@pytest.fixture
+def corrupt_pdf_bytes() -> bytes:
+    """Bytes that begin like a PDF but cannot be opened as one."""
+    return b"%PDF-1.4\nthis header is the only honest part of the file\n"
+
+
+@pytest.fixture
+def empty_page_pdf_bytes(empty_pdf: Path) -> bytes:
+    """The bytes of a valid PDF with no selectable text."""
+    return empty_pdf.read_bytes()
