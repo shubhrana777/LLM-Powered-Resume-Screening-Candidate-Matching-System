@@ -3,14 +3,36 @@
 Test PDFs are generated at runtime with PyMuPDF, which the project already
 depends on. That keeps the dependency list minimal (no reportlab/fpdf) and
 guarantees the fixtures stay in sync with the library doing the parsing.
+
+Embedding strategy for tests
+---------------------------
+Most tests use :class:`FakeEmbedder`, a deterministic bag-of-words embedder, so
+that the suite is fast, offline, and reproducible. Real transformer weights are
+a ~90 MB download and several seconds of load time; depending on them for every
+assertion would make the suite slow and network-dependent, and floating-point
+output can shift between model revisions.
+
+The fake still produces genuinely meaningful cosine similarities -- texts that
+share vocabulary score higher -- so ranking-order assertions are real tests of
+the matching logic, not tautologies.
+
+Tests that must exercise the actual Sentence Transformers model are marked
+``@pytest.mark.model`` and request the :func:`real_embedder` fixture, which
+skips automatically when the model cannot be loaded (offline CI, no cache).
+Run them with ``pytest -m model``; skip them with ``pytest -m "not model"``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 import fitz
+import numpy as np
 import pytest
+
+from app.embeddings import DEFAULT_MODEL_NAME, VECTOR_DTYPE, _validate_texts
+from app.models import Candidate
 
 SAMPLE_LINES = [
     "Jane Doe",
@@ -84,3 +106,134 @@ def corrupted_pdf(tmp_path: Path) -> Path:
 def missing_pdf(tmp_path: Path) -> Path:
     """A path inside a real directory that does not exist on disk."""
     return tmp_path / "does_not_exist.pdf"
+
+
+# --------------------------------------------------------------------------
+# Phase 2 fixtures
+# --------------------------------------------------------------------------
+
+VOCABULARY = (
+    "python",
+    "backend",
+    "api",
+    "sql",
+    "database",
+    "docker",
+    "kubernetes",
+    "machine",
+    "learning",
+    "pytorch",
+    "nlp",
+    "embeddings",
+    "react",
+    "frontend",
+    "javascript",
+    "pastry",
+    "baking",
+    "chocolate",
+    "dessert",
+    "kitchen",
+)
+
+
+class FakeEmbedder:
+    """A deterministic, offline stand-in for the real embedder.
+
+    Builds an L2-normalized bag-of-words vector over a fixed vocabulary, so
+    cosine similarity between two texts rises with their shared vocabulary.
+    That is enough for the matching engine's ranking behaviour to be tested
+    meaningfully without downloading transformer weights.
+
+    A constant bias component keeps the vector norm non-zero even for text that
+    contains none of the vocabulary, avoiding a divide-by-zero.
+
+    Input validation is delegated to the same helper the real embedder uses, so
+    the fake and the real implementation reject exactly the same inputs.
+
+    Args:
+        vocabulary: Tokens that make up the vector space.
+    """
+
+    BIAS = 0.1
+
+    def __init__(self, vocabulary: Sequence[str] = VOCABULARY) -> None:
+        self._vocabulary = tuple(vocabulary)
+
+    @property
+    def dimension(self) -> int:
+        """Vocabulary size plus one for the bias component."""
+        return len(self._vocabulary) + 1
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """Embed a single string as a 1-D unit vector."""
+        return self.embed_texts([text])[0]
+
+    def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
+        """Embed several strings as a 2-D array of unit vectors."""
+        cleaned = _validate_texts(texts)
+
+        vectors = np.zeros((len(cleaned), self.dimension), dtype=VECTOR_DTYPE)
+        for row, text in enumerate(cleaned):
+            words = text.lower().replace(",", " ").replace(".", " ").split()
+            for column, token in enumerate(self._vocabulary):
+                vectors[row, column] = words.count(token)
+            vectors[row, -1] = self.BIAS
+            vectors[row] /= np.linalg.norm(vectors[row])
+
+        return np.ascontiguousarray(vectors, dtype=VECTOR_DTYPE)
+
+
+@pytest.fixture
+def fake_embedder() -> FakeEmbedder:
+    """A deterministic offline embedder."""
+    return FakeEmbedder()
+
+
+@pytest.fixture(scope="session")
+def real_embedder():
+    """The actual Sentence Transformers embedder, or skip if unavailable.
+
+    Skips rather than fails when the model cannot be loaded, so the suite still
+    passes on a machine with no network access and no cached weights.
+    """
+    from app.embeddings import SentenceTransformerEmbedder
+
+    embedder = SentenceTransformerEmbedder(DEFAULT_MODEL_NAME)
+    try:
+        embedder.embed_text("warm up the model")
+    except Exception as exc:  # noqa: BLE001 - any failure means "cannot test"
+        pytest.skip(f"Sentence Transformers model unavailable: {exc}")
+    return embedder
+
+
+BACKEND_RESUME = "Python backend engineer building api services with sql database and docker"
+ML_RESUME = "Machine learning engineer using pytorch for nlp and embeddings in python"
+FRONTEND_RESUME = "Frontend developer building react interfaces in javascript"
+CHEF_RESUME = "Pastry chef specialising in baking chocolate dessert and kitchen management"
+
+BACKEND_JOB = "Hiring a python backend engineer for api and database work with docker"
+
+
+@pytest.fixture
+def sample_candidates() -> list[Candidate]:
+    """Four candidates spanning clearly different domains."""
+    return [
+        Candidate("c-backend", BACKEND_RESUME, "Backend Person"),
+        Candidate("c-ml", ML_RESUME, "ML Person"),
+        Candidate("c-frontend", FRONTEND_RESUME, "Frontend Person"),
+        Candidate("c-chef", CHEF_RESUME, "Chef Person"),
+    ]
+
+
+@pytest.fixture
+def resume_dir(tmp_path: Path) -> Path:
+    """A directory containing three resume PDFs and one non-PDF file."""
+    folder = tmp_path / "resumes"
+    folder.mkdir()
+
+    _write_pdf(folder / "alice_backend.pdf", [[BACKEND_RESUME]])
+    _write_pdf(folder / "bob_ml_resume.pdf", [[ML_RESUME]])
+    _write_pdf(folder / "carol_chef.pdf", [[CHEF_RESUME]])
+    (folder / "notes.txt").write_text("not a resume", encoding="utf-8")
+
+    return folder

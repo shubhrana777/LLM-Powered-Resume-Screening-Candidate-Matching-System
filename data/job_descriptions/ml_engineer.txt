@@ -1,0 +1,22 @@
+Machine Learning Engineer (NLP)
+
+About the role
+Join our applied ML team to build natural language understanding features for a
+document search product. You will train models and ship them as production
+inference services.
+
+Responsibilities
+- Train and evaluate transformer models for text classification and retrieval.
+- Build semantic search over large document collections using embeddings.
+- Package models as Python inference services and monitor them in production.
+- Work with engineers to integrate ML features into the product.
+
+Requirements
+- Strong Python and PyTorch experience.
+- Practical NLP experience with transformer architectures.
+- Familiarity with embedding models and vector similarity search.
+- Comfortable with Docker and production deployment.
+
+Nice to have
+- Experience with FAISS or another vector index.
+- Background in recommendation or ranking systems.

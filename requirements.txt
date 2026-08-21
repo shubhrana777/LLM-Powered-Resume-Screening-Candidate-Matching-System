@@ -1,5 +1,13 @@
-# Phase 1 dependencies -- PDF text extraction only.
+# Phase 1 -- PDF text extraction
 PyMuPDF==1.24.10
+
+# Phase 2 -- semantic matching
+# sentence-transformers pulls in torch, transformers and huggingface-hub.
+sentence-transformers==5.1.2
+faiss-cpu==1.13.2
+# Installed transitively by the two above, but imported directly by app/, so
+# it is declared explicitly rather than relied on as a transitive dependency.
+numpy==2.5.2
 
 # Development / testing
 pytest==8.3.3
