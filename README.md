@@ -1,16 +1,17 @@
 # LLM-Powered Resume Screening & Candidate Matching System
 
 A system that ranks candidates against a job description. It is built in phases;
-**Phases 1 and 2 are complete**.
+**Phases 1 to 3 are complete**.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 1 | PDF resume ingestion and text extraction | Done |
 | 2 | Semantic matching with embeddings and FAISS | Done |
-| 3+ | Skill analysis, LLM/RAG, API, dashboard, Docker | Not started |
+| 3 | Skill extraction and candidate analysis | Done |
+| 4+ | LLM/RAG, API, dashboard, Docker | Not started |
 
-Explicitly **not** implemented yet: LLM calls, LangChain, RAG, skill extraction,
-FastAPI, Streamlit, Docker, databases, authentication, and OCR for scanned PDFs.
+Explicitly **not** implemented yet: LLM calls, LangChain, RAG, FastAPI,
+Streamlit, Docker, databases, authentication, and OCR for scanned PDFs.
 
 ## Phase 1 scope — resume parsing
 
@@ -27,6 +28,17 @@ FastAPI, Streamlit, Docker, databases, authentication, and OCR for scanned PDFs.
 - Rank candidates against a job description by cosine similarity.
 - Return `candidate_id`, `candidate_name`, `similarity_score`, and `rank`.
 
+## Phase 3 scope — skill and candidate analysis
+
+- Extract skills from resumes and job descriptions against a configurable taxonomy.
+- Report matched and missing skills.
+- Extract stated years of experience, conservatively.
+- Extract common degree formats.
+- Build a structured `CandidateProfile` per candidate.
+- Compare candidate experience against an explicitly stated requirement.
+
+All Phase 3 extraction is deterministic string matching. No model is involved.
+
 ## Project structure
 
 ```
@@ -38,8 +50,13 @@ resume-screening-ai/
 │   ├── embeddings.py        # Phase 2: Sentence Transformers wrapper
 │   ├── vector_store.py      # Phase 2: FAISS index + metadata
 │   ├── matching.py          # Phase 2: ranking engine
-│   ├── models.py            # Phase 2: Candidate / MatchResult records
-│   └── main.py              # CLI: `extract` and `match` subcommands
+│   ├── skill_taxonomy.py    # Phase 3: configurable skill vocabulary
+│   ├── skill_extractor.py   # Phase 3: skill extraction and comparison
+│   ├── experience_extractor.py  # Phase 3: stated years of experience
+│   ├── education_extractor.py   # Phase 3: degree extraction
+│   ├── candidate_analyzer.py    # Phase 3: builds CandidateProfile records
+│   ├── models.py            # Typed records shared across phases
+│   └── main.py              # CLI: `extract`, `match`, `analyze` subcommands
 │
 ├── data/
 │   ├── resumes/             # Put your PDFs here (git-ignored)
@@ -55,7 +72,13 @@ resume-screening-ai/
 │   ├── test_embeddings.py
 │   ├── test_vector_store.py
 │   ├── test_matching.py
-│   └── test_integration.py
+│   ├── test_skill_taxonomy.py
+│   ├── test_skill_extractor.py
+│   ├── test_experience_extractor.py
+│   ├── test_education_extractor.py
+│   ├── test_candidate_analyzer.py
+│   ├── test_integration.py
+│   └── test_integration_phase3.py
 │
 ├── .gitignore
 ├── .env.example
@@ -118,7 +141,9 @@ Generate a set of fictional resumes to try things out:
 python scripts/generate_sample_data.py
 ```
 
-That writes six invented candidates into `data/resumes/`. The folder is
+That writes nine invented candidates into `data/resumes/` — six technical
+profiles plus three finance ones (a strong, a partial and a poor match) used to
+demonstrate Phase 3. The folder is
 git-ignored (except `.gitkeep`), so neither the samples nor any real candidate
 resume ever reaches version control. Sample job descriptions live in
 `data/job_descriptions/` and are committed, since they contain no personal data.
@@ -266,6 +291,237 @@ embedding and the resume embedding.
 - **Only relative ordering within one run is meaningful.** Absolute values are
   not comparable across different job descriptions.
 
+## Phase 3 — analysing candidates
+
+```bash
+python -m app.main analyze --job-description data/job_descriptions/financial_analyst.txt
+```
+
+Same options as `match`, plus `--show-extra-skills` to list skills the job did
+not ask for:
+
+```bash
+python -m app.main analyze -j data/job_descriptions/financial_analyst.txt -k 3
+python -m app.main analyze -t "Financial analyst, 3+ years, Python and SQL" --show-extra-skills
+```
+
+### Example output
+
+```
+JOB REQUIREMENTS
+  Required Skills: Python, SQL, Excel, Power BI, Tableau, Data Analysis, ...
+  Minimum Experience: 3 years
+
+CANDIDATES
+
+2. Sarah Wilson
+  Semantic Match Score: 0.5940
+  Matched Skills:
+    - Python
+    - SQL
+    - Excel
+    - Power BI
+    - Tableau
+    ...
+  Missing Skills:
+    - Investment Analysis
+  Skill Coverage: 12/13 required skills (92%)
+  Experience:
+    Candidate: 4 years
+    Required:  3 years
+    Requirement Met: Yes
+  Education:
+    MBA - Finance
+    Bachelor of Commerce - Accounting
+
+3. James Patel
+  Semantic Match Score: 0.4416
+  Skill Coverage: 4/13 required skills (31%)
+  Experience:
+    Candidate: 2 years
+    Required:  3 years
+    Requirement Met: No
+
+8. Nina Volkov
+  Semantic Match Score: 0.1491
+  Matched Skills: none
+  Skill Coverage: 0/13 required skills (0%)
+  Experience:
+    Candidate: not stated on resume
+    Required:  3 years
+    Requirement Met: Unknown
+      (unknown is reported as unknown, not as a pass or a fail)
+```
+
+Note that Sarah is ranked **2**, not 1, by semantic similarity, yet covers 92% of
+the required skills and clears the experience bar. This is exactly why Phase 3
+exists: a single similarity number cannot tell you *which* requirements a
+candidate meets, and the candidate the embedding likes most is not always the
+one who best fits the stated requirements. The two views are complementary, and
+both are shown.
+
+## How Phase 3 works
+
+### Skill extraction
+
+Extraction is exact matching against a fixed vocabulary — no model, no
+statistics. The same resume always yields the same skills, and every hit can be
+traced to the substring that produced it (`SkillExtractor.find_mentions` returns
+the matched text and its offsets).
+
+Naive substring matching would be badly wrong here. `"SQL" in text` reports SQL
+for *PostgreSQL*, *MySQL* and *sqlalchemy*; `"R"` reports R for every word
+containing the letter. Each alias is therefore compiled into a regex with custom
+boundaries:
+
+| Guard | Effect |
+| --- | --- |
+| `(?<![A-Za-z0-9+#&])` before | *MySQL* does not yield SQL; *R&D* does not yield R |
+| `(?![A-Za-z0-9+#&])` after | *C++* does not yield C; *sqlalchemy* does not yield SQL |
+| `(?!\.\w)` after | *Node.js* does not yield Node, while *"Python."* still yields Python |
+
+`\b` alone cannot do this: it is defined in terms of `\w`, so it misbehaves
+around `+`, `#` and `.` — precisely the characters real skill names contain.
+
+Two further rules:
+
+- Matching is case-insensitive, **except single-character skills** (`C`, `R`),
+  which must be capitalised. Otherwise a bullet like `c) managed the team` would
+  register the C language.
+- Spaces, hyphens and underscores inside an alias match any run of the same, so
+  `Power BI` also matches `power-bi`, `powerbi`, and a `Power` / `BI` line break
+  — which PDF extraction produces often.
+
+### Configurable skill taxonomy
+
+Every recognised skill lives in `app/skill_taxonomy.py`, never inline in the
+extraction code. A skill has a canonical name, a category, and any number of
+aliases. The canonical name is what gets reported, whichever alias matched, so a
+resume saying `k8s` satisfies a job asking for `Kubernetes`.
+
+Categories shipped: Programming, Data, AI/ML, Cloud/DevOps, Backend, Finance.
+
+Three ways to extend it, in increasing order of separation from the code:
+
+```python
+# 1. Add an entry to DEFAULT_SKILL_DEFINITIONS in the module.
+
+# 2. Extend at runtime; the original is left unchanged.
+from app.skill_taxonomy import DEFAULT_TAXONOMY, SkillDefinition
+taxonomy = DEFAULT_TAXONOMY.extended([SkillDefinition("Rust", "Programming", ("rustlang",))])
+
+# 3. Load from JSON, keeping the vocabulary out of the codebase entirely.
+from app.skill_taxonomy import SkillTaxonomy
+taxonomy = SkillTaxonomy.from_json_file("my_skills.json")
+# JSON shape: {"Category": {"Skill Name": ["alias", ...]}}
+```
+
+Pass a taxonomy to `SkillExtractor(taxonomy)` and the rest of the pipeline
+follows it.
+
+### Matched and missing skills
+
+```
+required_skills ─┐
+                 ├─► matched_skills     (required AND candidate)
+candidate_skills ┘   missing_skills     (required NOT candidate)
+                     additional_skills  (candidate NOT required)
+```
+
+Comparison is by canonical name and case-insensitive. Ordering is deterministic:
+`matched` and `missing` follow the order of the required list, `additional`
+follows the candidate order. `SkillComparison.coverage` is a plain count ratio,
+`len(matched) / required_count` — not a probability, not weighted, and `None`
+when the job named no recognised skills.
+
+### Experience extraction
+
+Deliberately conservative: a number is returned only when the text states it in
+words, near "experience".
+
+| Input | Result |
+| --- | --- |
+| `4 years of experience` | `4.0` |
+| `3+ years experience` | `3.0` |
+| `2.5 years of professional experience` | `2.5` |
+| `3-5 years of experience` | `3.0` (lower bound) |
+| `Experience: 5 years` | `5.0` |
+| `Graduated in 2015` | `None` |
+| `Acme Corp (2020-2024)` | `None` |
+| `Senior Engineer` | `None` |
+| `8 years building Python services` | `None` (no explicit "experience") |
+
+Nothing is inferred from graduation years, employment dates, or seniority words,
+and employment periods are never summed. When a resume states several figures the
+**largest** is taken as the overall total; when a job description states several,
+the **smallest** is taken as the bar to clear.
+
+### Education extraction
+
+Line-by-line matching of known degree spellings — `B.S.`, `BSc`, `B.Tech`,
+`B.E.`, `B.Com`, `M.S.`, `MSc`, `M.Tech`, `MBA`, `PhD`, `Ph.D.`, `Diploma`, and
+the spelled-out forms — plus the field of study when the same line names one.
+
+Bare `BS` and `MS` are deliberately **not** recognised, because "MS Excel" and
+"MS Office" appear on far more resumes than "MS Physics".
+
+### Candidate profiles
+
+`CandidateProfile` is a frozen dataclass carrying `candidate_id`,
+`candidate_name`, `skills`, `years_experience`, `education`, `matched_skills`,
+`missing_skills`, `additional_skills`, `semantic_match_score`, `rank`,
+`required_experience`, `meets_experience_requirement` and `source_path`.
+
+### Experience comparison
+
+| Required | Candidate | `meets_experience_requirement` |
+| --- | --- | --- |
+| 3.0 | 4.0 | `True` |
+| 3.0 | 2.0 | `False` |
+| 3.0 | `None` | `None` |
+| `None` | 4.0 | `None` |
+
+Unknown is never resolved into a pass or a fail. A resume that simply does not
+state its years is not a resume that fails the requirement.
+
+### Using Phase 3 as a library
+
+```python
+from pathlib import Path
+
+from app.candidate_analyzer import analyze_candidates_for_job
+from app.matching import load_candidates_from_directory
+
+loaded = load_candidates_from_directory("data/resumes")
+job_text = Path("data/job_descriptions/financial_analyst.txt").read_text(encoding="utf-8")
+
+requirements, profiles = analyze_candidates_for_job(loaded.candidates, job_text)
+
+for profile in profiles:
+    print(profile.rank, profile.display_name)
+    print("  matched:", profile.matched_skills)
+    print("  missing:", profile.missing_skills)
+    print("  experience:", profile.years_experience,
+          "meets:", profile.meets_experience_requirement)
+```
+
+Or use the pieces on their own:
+
+```python
+from app.education_extractor import extract_education
+from app.experience_extractor import extract_years_of_experience
+from app.skill_extractor import compare_skills, extract_skills
+
+extract_skills("Python, SQL and Power BI for forecasting")
+# ('Python', 'SQL', 'Power BI', 'Forecasting')
+
+compare_skills(["Python", "SQL", "Tableau"], ["Python", "SQL"]).missing
+# ('Tableau',)
+
+extract_years_of_experience("4 years of experience")   # 4.0
+extract_education("MBA in Finance")                    # (EducationEntry('MBA', 'Finance', ...),)
+```
+
 ## Using the engine as a library
 
 ```python
@@ -311,7 +567,9 @@ automatically** when the weights cannot be loaded, so the suite still passes on 
 machine with no network access.
 
 Test PDFs are generated at runtime with PyMuPDF, so no binary fixtures are
-committed.
+committed. The Phase 3 suites need neither a model nor a network: skill,
+experience and education extraction are pure string matching, so they are
+tested directly.
 
 ## Limitations
 
@@ -341,6 +599,71 @@ committed.
 - Longer documents tend to score slightly lower simply by covering more topics,
   so resume length is a mild confound.
 - English only in practice.
+
+### Skill extraction (Phase 3)
+
+Extraction is exact matching against a fixed list. It does not understand
+resumes; it recognises strings. The consequences are worth stating plainly:
+
+- **Only taxonomy skills are ever found.** A skill not in
+  `app/skill_taxonomy.py` does not exist as far as the system is concerned. A
+  candidate whose strongest skill is missing from the vocabulary is silently
+  under-reported, which is the most likely way this stage misjudges someone.
+- **No synonym or morphology handling beyond declared aliases.** "Forecasting"
+  is recognised because it is declared; "forecasted revenue monthly" matches via
+  the `forecast` alias, but an undeclared phrasing simply will not match.
+- **No context, negation, or proficiency.** "Familiar with Python", "learning
+  Python", "Python (beginner)" and "8 years of Python" all yield the same bare
+  `Python`. So does "we are replacing our Python stack". The extractor cannot
+  tell a skill someone *has* from a skill merely *mentioned*.
+- **No section awareness.** A skill in a job description's "Nice to have"
+  section is reported as required, exactly like one under "Requirements". In the
+  bundled sample this is visible: `Investment Analysis` appears in the required
+  list although the posting lists it as nice-to-have.
+- **Job titles can register as skills.** "Financial analyst" yields the skill
+  `Financial Analysis` via an alias. Usually right, occasionally not.
+- **Bare `C` and `R` remain the riskiest entries.** The boundary and
+  capitalisation rules block the common false positives (`c)`, `R&D`, `rapport`,
+  `C.S.`), but an isolated capital `C` or `R` in some other context would still
+  register. Drop them from the taxonomy if that trade-off does not suit you.
+- **Skill coverage is a flat count.** Every skill counts equally; a missing core
+  requirement weighs the same as a missing nice-to-have.
+
+### Experience extraction (Phase 3)
+
+- Only explicit statements near the word "experience" are read. A resume listing
+  a decade of dated roles but never writing "N years of experience" yields
+  `None` — correct behaviour by design, but it means **`None` is common on real
+  resumes**, and unknown must never be read as zero.
+- Where several figures appear, the largest is taken for a candidate and the
+  smallest for a job posting. A resume saying "3 years of experience with
+  Kubernetes" and nothing else yields `3.0` as its overall total, which
+  overstates a specific figure as a general one.
+- No domain awareness: it cannot distinguish total career experience from
+  experience relevant to the role.
+- Values above 60 years, and fragments of longer numbers, are rejected.
+
+### Education extraction (Phase 3)
+
+- Degree and field must appear on the same line; nothing is stitched across line
+  breaks, so a PDF that wraps awkwardly loses the field.
+- Bare `BS`/`MS` are not recognised, so "BS Computer Science" is missed. This is
+  a deliberate trade against "MS Excel" false positives.
+- The field is taken as text following the degree, cut at a comma, bracket or
+  year. Unusual layouts produce an odd field or none at all.
+- No institution, no dates, no accreditation, no honours, no verification. The
+  extractor keys on the word, not the context: "organised a bachelor party"
+  registers a bachelor's degree.
+- `extract_highest_degree` ranks by degree level only. It says nothing about
+  quality or relevance.
+
+### What Phase 3 does not do
+
+There is no judgement of candidate quality here, and no hiring decision. The
+output is a structured, checkable summary of what a resume *says*, next to a
+semantic similarity score — intended to help a human review faster, not to
+screen anyone out automatically. Every field is either extracted verbatim or
+reported as unknown.
 
 ### Matching engine
 

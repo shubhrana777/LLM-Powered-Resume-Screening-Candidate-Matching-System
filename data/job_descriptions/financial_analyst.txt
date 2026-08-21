@@ -1,0 +1,22 @@
+Financial Analyst
+
+About the role
+We are looking for a financial analyst with 3+ years of experience to support
+budgeting, forecasting and management reporting for a growing business unit.
+
+Responsibilities
+- Build and maintain financial models and rolling forecasts.
+- Produce monthly management reporting and variance analysis.
+- Automate recurring reporting using Python and SQL.
+- Develop dashboards in Power BI and Tableau for business stakeholders.
+
+Requirements
+- 3+ years of experience in financial analysis or a closely related role.
+- Strong Excel skills, including financial modeling.
+- Working knowledge of SQL for querying the data warehouse.
+- Experience with Python for data analysis and reporting automation.
+- Proficiency with Power BI and Tableau.
+
+Nice to have
+- Exposure to risk analysis and investment analysis.
+- A relevant degree in finance, economics or accounting.

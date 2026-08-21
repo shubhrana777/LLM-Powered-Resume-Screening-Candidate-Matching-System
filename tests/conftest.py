@@ -237,3 +237,121 @@ def resume_dir(tmp_path: Path) -> Path:
     (folder / "notes.txt").write_text("not a resume", encoding="utf-8")
 
     return folder
+
+
+# --------------------------------------------------------------------------
+# Phase 3 fixtures
+# --------------------------------------------------------------------------
+
+STRONG_ANALYST_RESUME = """Sarah Wilson
+Senior Financial Analyst
+
+SUMMARY
+Financial analyst with 4 years of experience in budgeting and forecasting.
+
+EXPERIENCE
+Senior Financial Analyst, Northgate Retail
+Built rolling forecasts and financial modeling for a large business unit.
+Automated reporting using Python and SQL.
+Developed Power BI dashboards for the executive team.
+
+SKILLS
+Excel, financial modeling, forecasting, SQL, Python, Power BI, budgeting
+
+EDUCATION
+MBA in Finance, Manchester Business School
+"""
+
+PARTIAL_ANALYST_RESUME = """James Patel
+Junior Finance Associate
+
+SUMMARY
+Finance associate with 2 years of experience supporting month-end reporting.
+
+EXPERIENCE
+Finance Associate, Ridgeway Logistics
+Prepared reconciliations and assisted with budgeting.
+Maintained workbooks in Excel and ran SQL queries.
+
+SKILLS
+Excel, SQL, budgeting, accounting
+
+EDUCATION
+B.Com Accounting and Finance, Aston University
+"""
+
+POOR_MATCH_RESUME = """Nina Volkov
+Graphic Designer
+
+EXPERIENCE
+Senior Graphic Designer, Studio Vlna
+Led brand identity projects and packaging design.
+
+SKILLS
+Illustrator, Photoshop, InDesign, typography, branding
+
+EDUCATION
+Diploma in Graphic Design, Prague College of Art
+"""
+
+ANALYST_JOB_DESCRIPTION = """Financial Analyst
+
+We are looking for a financial analyst with 3+ years of experience to support
+budgeting and forecasting.
+
+Requirements
+- Strong Excel skills, including financial modeling.
+- Working knowledge of SQL.
+- Experience with Python for data analysis.
+- Proficiency with Power BI and Tableau.
+"""
+
+
+@pytest.fixture
+def strong_candidate() -> Candidate:
+    """A candidate matching the analyst job well, with stated experience."""
+    return Candidate("c-strong", STRONG_ANALYST_RESUME, "Sarah Wilson")
+
+
+@pytest.fixture
+def partial_candidate() -> Candidate:
+    """A candidate matching some requirements, below the experience bar."""
+    return Candidate("c-partial", PARTIAL_ANALYST_RESUME, "James Patel")
+
+
+@pytest.fixture
+def poor_candidate() -> Candidate:
+    """An unrelated candidate who never states years of experience."""
+    return Candidate("c-poor", POOR_MATCH_RESUME, "Nina Volkov")
+
+
+@pytest.fixture
+def analyst_candidates(
+    strong_candidate: Candidate,
+    partial_candidate: Candidate,
+    poor_candidate: Candidate,
+) -> list[Candidate]:
+    """Strong, partial and poor candidates for the analyst job."""
+    return [strong_candidate, partial_candidate, poor_candidate]
+
+
+@pytest.fixture
+def analyst_job() -> str:
+    """A job description naming skills and a minimum experience."""
+    return ANALYST_JOB_DESCRIPTION
+
+
+@pytest.fixture
+def analyst_resume_dir(tmp_path: Path) -> Path:
+    """A directory of three analyst-candidate resume PDFs."""
+    folder = tmp_path / "analyst_resumes"
+    folder.mkdir()
+
+    for stem, text in (
+        ("sarah_wilson", STRONG_ANALYST_RESUME),
+        ("james_patel", PARTIAL_ANALYST_RESUME),
+        ("nina_volkov", POOR_MATCH_RESUME),
+    ):
+        _write_pdf(folder / f"{stem}.pdf", [text.splitlines()])
+
+    return folder
