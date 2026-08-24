@@ -1,9 +1,9 @@
-# Resume Screening AI
+# LLM-Powered-Resume-Screening-Candidate-Matching-System
 
-Resume Screening AI ranks a pool of PDF resumes against a job description and
-explains each ranking. It is built for recruiters and hiring managers who need to
-read a stack of resumes quickly, and for engineers who want the reasoning behind
-a ranking to be inspectable rather than opaque.
+LLM-Powered-Resume-Screening-Candidate-Matching-System ranks a pool of PDF resumes 
+against a job description and explains each ranking. It is built for recruiters and 
+hiring managers who need to read a stack of resumes quickly, and for engineers who
+want the reasoning behind a ranking to be inspectable rather than opaque.
 
 It combines two techniques. **Semantic matching** embeds each resume and the job
 description into vectors and compares them with a FAISS index, so a resume saying
