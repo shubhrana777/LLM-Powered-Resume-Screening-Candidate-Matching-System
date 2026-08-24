@@ -32,6 +32,8 @@ from app.api.schemas import (
     CandidateListResponse,
     CandidateMatch,
     CandidateSummary,
+    DeleteCandidatesRequest,
+    DeleteCandidatesResponse,
     ErrorResponse,
     EvidenceItem,
     HealthResponse,
@@ -434,3 +436,118 @@ def list_candidates(service: ServiceDep) -> CandidateListResponse:
             for failure in pool.failures
         ],
     )
+
+
+@router.delete(
+    "/candidates/{candidate_id}",
+    response_model=DeleteCandidatesResponse,
+    tags=["resumes"],
+    summary="Remove one candidate from the pool",
+    description=(
+        "Deletes one resume from the server's configured resume directory and "
+        "refreshes the pool, so the candidate stops appearing in rankings and can "
+        "no longer be analysed.\n\n"
+        "The path parameter names a candidate the server already holds; it is "
+        "looked up in the pool and never used to build a path."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+def delete_candidate(candidate_id: str, service: ServiceDep) -> DeleteCandidatesResponse:
+    """Remove one pooled candidate.
+
+    Args:
+        candidate_id: Candidate id, display name, or resume file name.
+        service: The shared screening service.
+
+    Returns:
+        What was removed and how many candidates remain.
+
+    Raises:
+        app.api.errors.NotFoundError: If the candidate is not in the pool.
+    """
+    logger.info("Delete request for candidate %r", candidate_id)
+
+    removed = service.delete_candidate(candidate_id)
+    remaining = len(service.load_pool().candidates)
+
+    logger.info("Deleted %s; %d candidate(s) remain", removed, remaining)
+
+    return DeleteCandidatesResponse(deleted=[removed], remaining=remaining)
+
+
+@router.post(
+    "/candidates/delete",
+    response_model=DeleteCandidatesResponse,
+    tags=["resumes"],
+    summary="Remove several candidates from the pool",
+    description=(
+        "Deletes each named candidate and refreshes the pool. A candidate that "
+        "cannot be removed is reported in `failed` and does not stop the rest of "
+        "the batch.\n\n"
+        "This is a POST rather than a DELETE because it carries a body, which "
+        "many HTTP clients and proxies will not send on a DELETE."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+def delete_candidates(
+    request: DeleteCandidatesRequest, service: ServiceDep
+) -> DeleteCandidatesResponse:
+    """Remove several pooled candidates.
+
+    Args:
+        request: Which candidates to remove.
+        service: The shared screening service.
+
+    Returns:
+        What was removed, what was not, and how many remain.
+    """
+    logger.info("Delete request for %d candidate(s)", len(request.candidates))
+
+    deleted, failures = service.delete_candidates(request.candidates)
+    remaining = len(service.load_pool().candidates)
+
+    logger.info(
+        "Deleted %d candidate(s), %d failed; %d remain",
+        len(deleted),
+        len(failures),
+        remaining,
+    )
+
+    return DeleteCandidatesResponse(
+        deleted=deleted,
+        failed=[f"{reference}: {reason}" for reference, reason in failures],
+        remaining=remaining,
+    )
+
+
+@router.delete(
+    "/candidates",
+    response_model=DeleteCandidatesResponse,
+    tags=["resumes"],
+    summary="Remove every candidate from the pool",
+    description=(
+        "Empties the candidate pool: every pooled resume is deleted and the "
+        "indexes are rebuilt from nothing.\n\n"
+        "Only files that are currently pooled candidates are touched -- anything "
+        "else in the directory is left alone. Clearing an already-empty pool is "
+        "not an error."
+    ),
+    responses=_ERROR_RESPONSES,
+)
+def clear_candidates(service: ServiceDep) -> DeleteCandidatesResponse:
+    """Remove every pooled candidate.
+
+    Args:
+        service: The shared screening service.
+
+    Returns:
+        Everything that was removed, and a remaining count of zero.
+    """
+    logger.info("Clear request for the whole candidate pool")
+
+    removed = service.clear_candidates()
+    remaining = len(service.load_pool().candidates)
+
+    logger.info("Cleared %d candidate(s); %d remain", len(removed), remaining)
+
+    return DeleteCandidatesResponse(deleted=removed, remaining=remaining)

@@ -126,6 +126,22 @@ def render_sidebar(client: ScreeningAPIClient, state) -> str:
     return page
 
 
+def _flush_notices(state) -> None:
+    """Show and consume any message left behind before a rerun.
+
+    A page that deletes something has to rerun to reflect the new pool, which
+    discards anything it rendered first. The message is parked in state and
+    shown once on the way back.
+    """
+    notice = state.pop("_delete_notice", None)
+    if notice:
+        st.success(notice, icon=":material/check_circle:")
+
+    failures = state.pop("_delete_failures", None)
+    if failures:
+        error_state("Some resumes could not be removed.", failures)
+
+
 def main() -> None:
     """Configure the page, resolve state, and render."""
     st.set_page_config(
@@ -145,6 +161,7 @@ def main() -> None:
     client = get_client()
 
     render_sidebar(client, state)
+    _flush_notices(state)
 
     try:
         pool = client.list_candidates()

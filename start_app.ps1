@@ -16,6 +16,10 @@
     Running it twice is safe: a service that is already up is reported and left
     alone.
 
+    If a .env file is present it is loaded into the environment first, so the
+    settings documented in .env.example take effect. Values already set in the
+    shell take precedence.
+
 .PARAMETER ApiPort
     Port for the API. Default 8000.
 
@@ -77,6 +81,43 @@ function Resolve-Python {
     $onPath = Get-Command python -ErrorAction SilentlyContinue
     if ($onPath) { return $onPath.Source }
     return $null
+}
+
+function Import-DotEnv {
+    <#  Load .env into this process's environment, if the file exists.
+
+        The application reads configuration from environment variables, not
+        from a file -- no code in app/ opens .env, and the project has no
+        dotenv dependency. This is what makes the documented
+        "copy .env.example .env" step actually take effect: the values are
+        read here and handed to both services as ordinary environment
+        variables.
+
+        Values already set in the shell win, so an explicit
+        `$env:LLM_PROVIDER = "anthropic"` is never silently overridden. #>
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) { return 0 }
+
+    $applied = 0
+    foreach ($line in Get-Content $Path) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+
+        $split = $trimmed.IndexOf('=')
+        if ($split -lt 1) { continue }
+
+        $name = $trimmed.Substring(0, $split).Trim()
+        $value = $trimmed.Substring($split + 1).Trim().Trim('"').Trim("'")
+
+        if (-not $value) { continue }
+        if ([Environment]::GetEnvironmentVariable($name)) { continue }
+
+        [Environment]::SetEnvironmentVariable($name, $value)
+        $applied++
+    }
+
+    return $applied
 }
 
 function Get-RunningService {
@@ -204,6 +245,14 @@ if (-not $PythonExe) {
     exit 1
 }
 Write-Step "Python: $PythonExe"
+
+$envFile = Join-Path $ProjectRoot '.env'
+$loaded = Import-DotEnv -Path $envFile
+if ($loaded -gt 0) {
+    Write-Ok "Loaded $loaded setting(s) from .env"
+} elseif (Test-Path $envFile) {
+    Write-Info ".env found; nothing new to apply"
+}
 
 if (-not (Test-Path (Join-Path $ProjectRoot 'app\api\main.py'))) {
     Write-Fail "This does not look like the project root." "Run the script from the repository root: .\start_app.ps1"

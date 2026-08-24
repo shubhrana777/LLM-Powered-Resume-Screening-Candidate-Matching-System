@@ -25,7 +25,7 @@ Three things can go wrong, and a recruiter needs to tell them apart:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
@@ -261,6 +261,39 @@ class ScreeningAPIClient:
             files={"file": (filename, content, "application/pdf")},
             data={"store": str(bool(store)).lower()},
         )
+
+    def delete_candidate(self, candidate: str) -> dict[str, Any]:
+        """``DELETE /candidates/{id}`` -- remove one candidate from the pool.
+
+        Args:
+            candidate: Candidate id, display name or file name. Resolved by the
+                backend against its own pool; never a path.
+
+        Returns:
+            What was deleted and how many candidates remain.
+        """
+        return self._request("DELETE", f"/candidates/{candidate}")
+
+    def delete_candidates(self, candidates: Sequence[str]) -> dict[str, Any]:
+        """``POST /candidates/delete`` -- remove several candidates.
+
+        Args:
+            candidates: Candidate ids, names or file names.
+
+        Returns:
+            What was deleted, what was not, and how many remain.
+        """
+        return self._request(
+            "POST", "/candidates/delete", json={"candidates": list(candidates)}
+        )
+
+    def clear_candidates(self) -> dict[str, Any]:
+        """``DELETE /candidates`` -- empty the candidate pool.
+
+        Returns:
+            Every id that was removed, and a remaining count.
+        """
+        return self._request("DELETE", "/candidates")
 
     def match_candidates(self, job_description: str, top_k: int) -> dict[str, Any]:
         """``POST /match-candidates`` -- rank the pool.

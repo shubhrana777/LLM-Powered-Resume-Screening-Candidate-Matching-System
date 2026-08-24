@@ -37,9 +37,10 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from app.api.config import Settings
-from app.api.errors import BadRequestError, NotFoundError
+from app.api.errors import APIError, BadRequestError, NotFoundError
 from app.embeddings import TextEmbedder, get_default_embedder
 from app.llm import LLMProvider, get_llm_provider
 from app.matching import (
@@ -412,9 +413,7 @@ class ScreeningService:
 
         with self._lock:
             shutil.copyfile(source, destination)
-            self._pool = None
-            self._matcher = None
-            self._pipeline = None
+            self._invalidate()
 
         logger.info("Stored resume as %s", destination.name)
 
@@ -426,3 +425,156 @@ class ScreeningService:
             "The resume was stored but could not be read back.",
             code="storage_failed",
         )
+
+    def _invalidate(self) -> None:
+        """Drop the pool and every index built from it.
+
+        Called whenever the resume directory changes underneath us. Dropping
+        the matcher and the pipeline is the part that matters: a FAISS index
+        outlives the files it was built from, so leaving either in place would
+        let a deleted candidate keep appearing in rankings and keep being
+        analysable. The caller must hold ``self._lock``.
+        """
+        self._pool = None
+        self._matcher = None
+        self._pipeline = None
+
+    def _resume_path_for(self, candidate: Candidate) -> Path:
+        """Return the on-disk path of a pooled candidate, checked for containment.
+
+        Args:
+            candidate: A candidate that came out of the pool.
+
+        Returns:
+            The resolved path of that candidate's resume.
+
+        Raises:
+            BadRequestError: If the candidate has no source file, or that file
+                resolves outside the configured resume directory. The candidate
+                was resolved from the pool rather than from client input, so
+                this should be unreachable -- which is exactly why it raises
+                instead of deleting.
+        """
+        directory = self._settings.resume_dir.resolve()
+        source = candidate.source_path
+
+        if source is None:
+            raise BadRequestError(
+                "That candidate has no resume file on this server.",
+                code="not_deletable",
+            )
+
+        resolved = Path(source).resolve()
+        if resolved.parent != directory:
+            raise BadRequestError(
+                "That candidate's resume is not in the configured resume directory.",
+                code="not_deletable",
+            )
+
+        return resolved
+
+    def delete_candidate(self, reference: str) -> str:
+        """Remove one candidate's resume from the pool.
+
+        The reference is resolved against the candidates already loaded from
+        the server's own directory, exactly as :meth:`resolve_candidate` does,
+        so it can only ever name a file the pool already contains. Nothing here
+        accepts or constructs a path from client input.
+
+        Args:
+            reference: Candidate id, display name, or resume file name.
+
+        Returns:
+            The id of the candidate that was removed.
+
+        Raises:
+            NotFoundError: If nothing in the pool matches.
+            BadRequestError: If the file cannot be deleted.
+        """
+        candidate = self.resolve_candidate(reference)
+        path = self._resume_path_for(candidate)
+
+        with self._lock:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                # Already gone: the pool was stale, which the refresh fixes.
+                logger.info("Resume %s was already absent", path.name)
+            except OSError as exc:
+                logger.error("Could not delete %s: %s", path.name, exc)
+                raise BadRequestError(
+                    "That resume could not be deleted. It may be open in "
+                    "another program.",
+                    code="delete_failed",
+                ) from exc
+
+            self._invalidate()
+
+        logger.info("Deleted resume %s", candidate.candidate_id)
+        return candidate.candidate_id
+
+    def delete_candidates(self, references: Sequence[str]) -> tuple[list[str], list[tuple[str, str]]]:
+        """Remove several candidates, reporting each outcome separately.
+
+        One failure does not abandon the rest: a batch delete where the second
+        of five files is locked should still remove the other four, and say
+        which one it could not.
+
+        Args:
+            references: Candidate ids, names or file names.
+
+        Returns:
+            A ``(deleted, failures)`` pair, where ``failures`` holds
+            ``(reference, reason)`` for each one that could not be removed.
+        """
+        deleted: list[str] = []
+        failures: list[tuple[str, str]] = []
+
+        for reference in references:
+            try:
+                deleted.append(self.delete_candidate(reference))
+            except APIError as error:
+                failures.append((reference, error.detail))
+
+        return deleted, failures
+
+    def clear_candidates(self) -> list[str]:
+        """Remove every resume from the pool.
+
+        Only files that are currently pooled candidates are touched. Anything
+        else in the directory -- a README, a subfolder, a non-PDF -- is left
+        exactly as it was.
+
+        Returns:
+            The ids that were removed, which is empty when the pool was empty.
+
+        Raises:
+            NotFoundError: If the configured directory does not exist.
+        """
+        pool = self.load_pool()
+        if not pool.candidates:
+            return []
+
+        removed: list[str] = []
+        for candidate in pool.candidates:
+            try:
+                path = self._resume_path_for(candidate)
+            except APIError:
+                continue
+
+            with self._lock:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.error("Could not delete %s: %s", path.name, exc)
+                    continue
+
+            removed.append(candidate.candidate_id)
+
+        with self._lock:
+            self._invalidate()
+
+        logger.info("Cleared %d resume(s) from the pool", len(removed))
+        return removed

@@ -24,7 +24,7 @@ candidate pool is re-read from the API on each render, because uploads change it
 
 from __future__ import annotations
 
-from typing import Any, MutableMapping
+from typing import Any, Iterable, MutableMapping
 
 __all__ = [
     "PAGES",
@@ -36,10 +36,12 @@ __all__ = [
     "get_ranking",
     "set_ranking",
     "clear_results",
+    "new_session",
     "get_analysis",
     "store_analysis",
     "all_analyses",
     "analysed_count",
+    "forget_candidates",
     "select_candidate",
     "get_selected_candidate",
     "goto",
@@ -48,7 +50,7 @@ __all__ = [
     "completed_steps",
 ]
 
-PAGES: tuple[str, ...] = ("Overview", "Screening", "Ranking", "Candidate")
+PAGES: tuple[str, ...] = ("Overview", "Screening", "Ranking", "Candidate", "Resumes")
 DEFAULT_PAGE = "Overview"
 
 # Where a requested navigation waits until it can be applied. See :func:`goto`.
@@ -61,6 +63,7 @@ _DEFAULTS: dict[str, Any] = {
     "analyses": {},
     "selected_candidate": None,
     "upload_results": [],
+    "confirm_clear_pool": False,
     PENDING_PAGE_KEY: None,
 }
 
@@ -133,6 +136,22 @@ def clear_results(state: MutableMapping[str, Any]) -> None:
     state["selected_candidate"] = None
 
 
+def new_session(state: MutableMapping[str, Any]) -> None:
+    """Start a fresh screening session.
+
+    Clears the job description, the ranking, every analysis, the selection and
+    the last upload report -- everything that belonged to screening one role.
+
+    It deliberately does **not** touch the resume pool. The pool lives on the
+    server and is shared across sessions: a recruiter starting on a new vacancy
+    expects their candidates to still be there. Emptying it is a separate,
+    explicitly confirmed action on the Resumes page.
+    """
+    state["job_description"] = ""
+    state["upload_results"] = []
+    clear_results(state)
+
+
 def get_analysis(state: MutableMapping[str, Any], candidate_id: str) -> dict[str, Any] | None:
     """Return the stored analysis for one candidate, if there is one."""
     analyses = state.get("analyses") or {}
@@ -152,6 +171,31 @@ def all_analyses(state: MutableMapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Return every cached analysis, keyed by candidate id."""
     analyses = state.get("analyses")
     return analyses if isinstance(analyses, dict) else {}
+
+
+def forget_candidates(state: MutableMapping[str, Any], candidate_ids: Iterable[str]) -> None:
+    """Drop cached results for candidates that no longer exist.
+
+    Deleting a resume invalidates anything derived from it. The ranking is
+    dropped wholesale rather than filtered, because its ranks and its
+    "considered" count would otherwise describe a pool that has changed.
+
+    Args:
+        state: The session state mapping.
+        candidate_ids: The candidates that were removed.
+    """
+    removed = {str(item) for item in candidate_ids}
+    if not removed:
+        return
+
+    analyses = all_analyses(state)
+    for candidate_id in removed:
+        analyses.pop(candidate_id, None)
+
+    if get_selected_candidate(state) in removed:
+        state["selected_candidate"] = None
+
+    state["ranking"] = None
 
 
 def analysed_count(state: MutableMapping[str, Any]) -> int:

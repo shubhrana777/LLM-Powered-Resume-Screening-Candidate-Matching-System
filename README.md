@@ -1,348 +1,1084 @@
-# LLM-Powered Resume Screening & Candidate Matching System
+# Resume Screening & Candidate Matching System
 
-A system that ranks candidates against a job description. It is built in phases;
-**Phases 1 to 6 are complete**.
+A recruiter-facing tool that ranks candidates against a job description using
+semantic search, extracts their skills and experience with deterministic rules,
+and produces a written assessment grounded in passages retrieved from each
+candidate's own resume.
 
-| Phase | Scope | Status |
-| --- | --- | --- |
-| 1 | PDF resume ingestion and text extraction | Done |
-| 2 | Semantic matching with embeddings and FAISS | Done |
-| 3 | Skill extraction and candidate analysis | Done |
-| 4 | LLM analysis grounded in retrieved evidence (RAG) | Done |
-| 5 | FastAPI REST backend | Done |
-| 6 | Streamlit recruiter dashboard | Done |
-| 7+ | Docker, production polish | Not started |
+It runs as two local services: a **FastAPI** backend that does the work, and a
+**Streamlit** dashboard that talks to it over HTTP.
 
-Explicitly **not** implemented yet: Docker, databases, authentication,
-deployment, and OCR for scanned PDFs.
+Everything runs locally. No API key is required — candidate analysis defaults to
+an offline deterministic provider, so the whole application and its full test
+suite work with no credentials and no network access after the first run.
+
+---
+
+## What it does
+
+1. Reads PDF resumes and extracts clean text.
+2. Embeds resumes and job descriptions, and ranks candidates by semantic
+   similarity using a FAISS index.
+3. Extracts skills, years of experience and degrees using a fixed taxonomy and
+   explicit rules — no model, so the result is exact and explainable.
+4. Retrieves the passages of a candidate's resume most relevant to the role.
+5. Asks a language model to assess the candidate **using only** that retrieved
+   material and the extracted profile.
+6. Validates the response against the extracted profile, removing claims the
+   resume does not support and recording every correction.
+7. Presents all of it in a dashboard, with the source passages shown next to
+   the generated text.
+
+### Features
+
+- Multi-file PDF upload, with per-file validation and clear rejection reasons.
+- Semantic ranking across the whole candidate pool.
+- Per-candidate analysis: matched skills, gaps, experience fit, education,
+  written summary, and the evidence it rests on.
+- Filtering, sorting and search over the ranked list, plus two charts.
+- Resume pool management: remove one, remove several, or clear the pool.
+- Screening sessions that reset the current role without deleting resumes.
+- A REST API with generated OpenAPI documentation.
+- A command-line interface for the same pipeline.
+- 1321 automated tests; the whole suite runs offline.
+
+### What it does not do
+
+This is a decision-support tool, not an automated screener. It orders resumes
+and summarises them for a human reviewer. It does not decide anything, its
+scores are not calibrated, and its written output can be wrong in ways the
+validation layer cannot catch. There is no authentication, and it is intended to
+be run locally.
+
+---
 
 ## Quick start
 
+Windows PowerShell, from a clean clone:
+
 ```powershell
+git clone <repository-url>
+cd "LLM-Powered Resume Screening & Candidate Matching System"
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
-python scripts/generate_sample_data.py   # fictional sample resumes
-.\start_app.ps1                          # starts the API and the dashboard
+
+copy .env.example .env          # optional; every setting has a default
+python scripts\generate_sample_data.py
+
+.\start_app.ps1
 ```
 
-| | |
+Then open **<http://localhost:8501>**.
+
+| What | URL |
 | --- | --- |
-| Dashboard | <http://localhost:8501> |
+| **Dashboard** — start here | <http://localhost:8501> |
 | API | <http://127.0.0.1:8000> |
-| API docs | <http://127.0.0.1:8000/docs> |
+| API documentation (Swagger UI) | <http://127.0.0.1:8000/docs> |
+| API documentation (ReDoc) | <http://127.0.0.1:8000/redoc> |
 
-`.\stop_app.ps1` stops both. On macOS or Linux, or to run them separately,
-see [Running the two services](#running-the-two-services).
+Stop both services with:
 
-No API key is needed: the LLM provider defaults to an offline deterministic
-one. See *Configuration* to point it at a real model.
+```powershell
+.\stop_app.ps1
+```
+
+### If PowerShell blocks the script
+
+Windows may refuse to run a local script. This allows it **for the current
+PowerShell window only**, and changes nothing permanently:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\start_app.ps1
+```
+
+Closing the window undoes it. Avoid `-Scope CurrentUser` or `-Scope LocalMachine`
+unless you intend a lasting change to your machine.
+
+### If the scripts do not work at all
+
+Start the two services by hand, in two separate terminals, backend first. Both
+commands use `python -m` so they do not depend on `uvicorn` or `streamlit` being
+on your `PATH`:
+
+```powershell
+# Terminal 1 — the API
+.\.venv\Scripts\Activate.ps1
+python -m uvicorn app.api.main:app --reload
+```
+
+```powershell
+# Terminal 2 — the dashboard
+.\.venv\Scripts\Activate.ps1
+python -m streamlit run app/ui/dashboard.py
+```
+
+Note that `.env` is **only** loaded by `start_app.ps1`. When starting by hand,
+set any variable you need in the shell first:
+
+```powershell
+$env:LLM_PROVIDER = "anthropic"
+```
+
+Stop a manually started service with `Ctrl+C` in its terminal.
+
+---
+
+## The first five minutes
+
+A walk through the whole system, using the bundled sample data.
+
+**1. Install and start.** Follow the Quick start above. The first start takes
+about a minute: the API downloads the embedding model (~90 MB) on first use and
+caches it, so later starts are fast.
+
+**2. Open the dashboard** at <http://localhost:8501>. The sidebar should show
+*API connected*. If it shows *API unreachable*, see [Troubleshooting](#troubleshooting).
+
+**3. Look at the pool.** The **Resumes** page lists the sample candidates that
+`generate_sample_data.py` created. They are fictional.
+
+**4. Upload a resume.** On **Screening**, under *Candidate pool*, add any
+text-based PDF and click *Add to pool*. It joins the pool and becomes rankable.
+A scanned image is rejected with a reason — there is no OCR.
+
+**5. Describe the role.** Still on **Screening**, paste a job description into
+step 1 and save. `data/job_descriptions/financial_analyst.txt` is a good one to
+start with. The more explicit it is about skills and required years, the more
+there is to compare against.
+
+**6. Rank the candidates.** Step 2. Every resume is scored against the role and
+you land on the **Ranking** page — a table, a top-match callout, and a
+similarity chart. Skill coverage and recommendation read *Not analyzed yet*,
+because ranking and analysis are separate steps.
+
+**7. Analyse a shortlist.** On **Ranking**, choose how many of the top
+candidates to analyse and click *Analyze*. Each one costs a model call. The
+table fills in with skill coverage, experience fit and a recommendation.
+
+**8. Open a candidate.** Pick one and click *View full analysis*. You get four
+distinct measures, matched skills and gaps, experience, education, the written
+summary, and — at the bottom — the verbatim resume passages the model was shown.
+Compare the summary against the evidence; that is the intended way to read it.
+
+**9. Delete a resume.** On **Resumes**, remove one. It disappears from the pool
+immediately and can no longer be ranked or analysed. *New screening session*
+clears the current role and its results but keeps every resume.
+
+**10. Run the tests.**
+
+```powershell
+python -m pytest
+```
+
+Expect `1316 passed, 5 skipped`. The [test section](#tests) explains the skips.
+
+---
 
 ## Architecture
 
-Eight stages, each owned by one module. Nothing below re-implements anything
-above it.
-
-### 1. Ingestion
-PDF resumes are parsed into clean text. `resume_parser.py`
-
-### 2. Ranking
-The job description and every resume are embedded and compared by cosine
-similarity, with FAISS doing the search. This orders the pile; it decides
-nothing. `embeddings.py`, `vector_store.py`, `matching.py`
-
-### 3. Candidate analysis
-Skills, years of experience and degrees are extracted by deterministic rules
-against a fixed taxonomy — no model involved, so the result is exact and
-explainable. `skill_taxonomy.py`, `skill_extractor.py`,
-`experience_extractor.py`, `education_extractor.py`, `candidate_analyzer.py`
-
-### 4. Grounded retrieval
-The selected candidate's resume is split into overlapping chunks, each indexed
-in that candidate's **own** FAISS index, and the passages closest to the job
-requirements are retrieved. One index per candidate is what makes cross-
-contamination structurally impossible rather than a filter that could have a
-bug. `chunker.py`, `retriever.py`
-
-### 5. LLM analysis
-The job description, the deterministic profile and the retrieved passages —
-and nothing else — are assembled into a prompt. The model sees only material
-that came from this candidate. `rag_context.py`, `prompts.py`, `llm.py`
-
-### 6. Validation
-The response is parsed and checked against the deterministic profile. Skills
-the resume does not support are removed, invented durations and degrees are
-flagged, and a recommendation outside the vocabulary becomes
-`INSUFFICIENT_INFORMATION`. Every correction is recorded in `warnings`.
-`analysis_parser.py`, orchestrated by `rag_pipeline.py`
-
-### 7. API
-FastAPI exposes the whole thing over HTTP, holding the parsed pool and its
-indexes in memory so they are built once rather than per request. `app/api/`
-
-### 8. UI
-Streamlit provides the recruiter dashboard. It is a pure client: it talks to
-the API over HTTP and imports nothing from the layers above. `app/ui/`
-
-### The pipeline
+Two processes. The dashboard holds no application logic: it renders what the API
+returns, and imports nothing from the API's internals — a test enforces that
+boundary.
 
 ```mermaid
 flowchart TD
-    JD[Job description] --> EMB[Embedding]
-    PDF[PDF resumes] --> TXT[Resume text]
-    TXT --> EMB
-    EMB --> RANK[Candidate ranking<br/>cosine similarity]
-    RANK --> PICK[Select top candidates]
-    PICK --> EXTRACT[Skill / experience / education extraction<br/>deterministic]
-    PICK --> CHUNKS[Resume chunk retrieval<br/>scoped to one candidate]
-    EXTRACT --> CTX[Grounded context]
-    CHUNKS --> CTX
-    CTX --> LLM[LLM]
-    LLM --> VALID[Validation against the profile]
-    EXTRACT --> VALID
-    VALID --> UI[Recruiter dashboard]
+    B[Browser] --> UI["Streamlit dashboard<br/>port 8501"]
+    UI -->|HTTP · API_BASE_URL| API["FastAPI service<br/>port 8000"]
+    API --> SVC["Screening service<br/>cached pool + indexes"]
+
+    SVC --> P[Resume parser<br/>PDF to text]
+    SVC --> E[Embeddings<br/>Sentence Transformers]
+    E --> F[(FAISS index)]
+    F --> RANK[Semantic ranking]
+
+    SVC --> SK[Skill / experience /<br/>education extraction]
+    SVC --> RET[Chunk retrieval<br/>scoped per candidate]
+    RET --> CTX[Grounded context]
+    SK --> CTX
+    CTX --> LLM[LLM analysis]
+    LLM --> VAL[Validation against<br/>the extracted profile]
+    SK --> VAL
+    VAL --> API
+    RANK --> API
+    API --> UI
 ```
 
-Everything left of `LLM` is deterministic: the same resume and the same job
-description always produce the same skills, the same experience verdict and the
-same retrieved passages. Only the summary and the recommendation are generated,
-and both are checked before they are shown.
+### The two services
 
-### Request path
+| | Dashboard | API |
+| --- | --- | --- |
+| Command | `python -m streamlit run app/ui/dashboard.py` | `python -m uvicorn app.api.main:app --reload` |
+| Default port | 8501 | 8000 |
+| Package | `app/ui/` | `app/api/` |
+| Reads resumes from disk | No | Yes |
+| Loads the embedding model | No | Yes |
+| Needs the other to work | Yes | No |
 
-```mermaid
-flowchart LR
-    B[Browser] --> S[Streamlit UI]
-    S -->|HTTP| F[FastAPI]
-    F --> SV[Screening service<br/>cached pool + indexes]
-    SV --> M[Matching]
-    SV --> A[Analysis]
-    SV --> R[RAG]
-    M --> D[(Resume data)]
-    A --> D
-    R --> D
+The dashboard finds the API through `API_BASE_URL`, which defaults to
+`http://127.0.0.1:8000`. Point it elsewhere and the same dashboard drives a
+backend on another machine. Every request goes through one module,
+`app/ui/api_client.py`; no other UI file makes an HTTP call.
+
+If the API is not running, the dashboard says so and shows how to start it
+rather than displaying an empty screen.
+
+### Pipeline stages
+
+| Stage | Modules |
+| --- | --- |
+| 1. Ingestion — PDF to clean text | `resume_parser.py` |
+| 2. Ranking — embed, index, compare | `embeddings.py`, `vector_store.py`, `matching.py` |
+| 3. Extraction — skills, experience, education | `skill_taxonomy.py`, `skill_extractor.py`, `experience_extractor.py`, `education_extractor.py`, `candidate_analyzer.py` |
+| 4. Retrieval — chunk and search, per candidate | `chunker.py`, `retriever.py` |
+| 5. Generation — grounded prompt, model call | `rag_context.py`, `prompts.py`, `llm.py` |
+| 6. Validation — check output against the profile | `analysis_parser.py`, `rag_pipeline.py` |
+| 7. API | `app/api/` |
+| 8. Dashboard | `app/ui/` |
+
+Everything up to stage 5 is deterministic: the same resume and job description
+always produce the same skills, the same experience verdict and the same
+retrieved passages. Only the summary and recommendation are generated, and both
+are validated before they are shown.
+
+---
+
+## Project walkthrough — the life of a candidate
+
+```
+PDF uploaded
+   ↓  resume_parser.py          validate, extract text, normalise whitespace
+resume text
+   ↓  chunker.py                80-word windows, 20-word overlap
+chunks
+   ↓  embeddings.py             Sentence Transformers, L2-normalised vectors
+vectors
+   ↓  vector_store.py           FAISS index — one per candidate for retrieval,
+   │                            one shared for ranking
+   ↓  matching.py               cosine similarity against the job description
+semantic rank
+   ↓  skill_extractor.py        boundary-guarded matching against a taxonomy
+   ↓  experience_extractor.py   only durations the resume states outright
+   ↓  education_extractor.py    degrees found in the text
+candidate profile
+   ↓  retriever.py              passages closest to the role, this candidate only
+   ↓  rag_context.py            job description + profile + evidence, nothing else
+   ↓  prompts.py, llm.py        one model call
+raw response
+   ↓  analysis_parser.py        unsupported claims removed and recorded
+validated analysis
+   ↓  app/api/routes.py         rendered as JSON
+   ↓  app/ui/pages.py           rendered for the recruiter
 ```
 
-The dashboard never reads a resume from disk, never loads a model, and never
-imports `app.api.service` or any Phase 1–4 module — a test enforces that. Point
-`API_BASE_URL` elsewhere and the same dashboard drives a backend on another
-machine.
+Two properties are enforced structurally rather than by convention:
 
-### The four measures
+- **Candidate isolation.** Each candidate's chunks live in their own FAISS
+  index, so a search scoped to one candidate physically cannot reach another's
+  text. A filter could have a bug; a separate index cannot.
+- **Grounding.** The model receives only the job description, the deterministic
+  profile and that candidate's retrieved passages. What comes back is checked
+  against the profile: skills the resume does not support are removed, invented
+  durations and degrees are flagged, and a recommendation outside the fixed
+  vocabulary becomes `INSUFFICIENT_INFORMATION`. Corrections are listed in
+  `warnings`, and `is_grounded` is false whenever any were needed.
+
+This reduces hallucination. It does not eliminate it — see
+[Known limitations](#known-limitations).
+
+---
+
+## The four measures
 
 A candidate ends up with four figures. They come from different places and
-regularly disagree; that disagreement is information, not a bug.
+regularly disagree; that disagreement is information.
 
-| | What it is | Where it comes from | Shown as |
+| | What it measures | Where it comes from | Displayed as |
 | --- | --- | --- | --- |
 | **Semantic similarity** | How alike the resume and the job description read in embedding space | Measured — cosine similarity | `59.35%` |
-| **Skill coverage** | How many named requirements the resume actually mentions | Extracted — deterministic, from a fixed taxonomy | `11 / 12` |
-| **Experience** | Whether stated years meet stated years | Extracted — three-way, unknown stays unknown | `Requirement met` |
-| **Recommendation** | A coarse ordinal assessment | Generated by the LLM, then validated | `Strong match` |
+| **Skill coverage** | How many named requirements appear on the resume | Extracted — deterministic, fixed taxonomy | `11 / 12` |
+| **Experience** | Whether stated years meet stated years | Extracted — three-way; unknown stays unknown | `Requirement met` |
+| **Recommendation** | A coarse overall assessment | Generated by the model, then validated | `Strong match` |
 
-**similarity ≠ skill coverage ≠ recommendation.** A candidate can read as very
-similar and cover few requirements — that usually means the resume is written in
-the same register as the job description without containing the substance. The
-dashboard shows all four side by side for exactly that reason.
+**similarity ≠ skill coverage ≠ recommendation.** A candidate can read as highly
+similar while covering few requirements — usually a resume written in the same
+register as the job description without the substance behind it. The dashboard
+shows all four side by side for that reason.
 
-The percentage on similarity is a readability convention for a value that runs
-0–1, not a probability. The stored and API-returned value is the raw cosine
-number, unchanged.
+### About the percentage
 
-## Phase 1 scope — resume parsing
+Similarity is stored and returned by the API as a raw cosine value in `[-1, 1]`,
+for example `0.5935`. The dashboard displays `59.35%` because that is easier to
+scan. **The percent sign is a readability convention for a value that runs 0–1,
+not a probability.** The wording shown beside it says so:
 
-- Accept a path to a PDF resume.
-- Open the file safely and extract text from every page.
-- Normalize whitespace and drop empty lines.
-- Fail with clear messages for missing files, non-PDF files, corrupted PDFs,
-  and PDFs with no selectable text.
+> Semantic similarity between the job description and candidate resume
+> embeddings. This is a ranking signal, not a hiring probability or percentage
+> of requirements met.
 
-## Phase 2 scope — semantic matching
+The candidate detail view also shows the raw cosine value. No stored or
+API-returned number is scaled.
 
-- Embed resumes and job descriptions with Sentence Transformers.
-- Index resume vectors in FAISS.
-- Rank candidates against a job description by cosine similarity.
-- Return `candidate_id`, `candidate_name`, `similarity_score`, and `rank`.
+---
 
-## Phase 3 scope — skill and candidate analysis
+## Technology stack
 
-- Extract skills from resumes and job descriptions against a configurable taxonomy.
-- Report matched and missing skills.
-- Extract stated years of experience, conservatively.
-- Extract common degree formats.
-- Build a structured `CandidateProfile` per candidate.
-- Compare candidate experience against an explicitly stated requirement.
+| Area | Choice |
+| --- | --- |
+| Language | Python 3.11+ (developed and tested on 3.12) |
+| PDF extraction | PyMuPDF |
+| Embeddings | Sentence Transformers — `all-MiniLM-L6-v2` |
+| Vector search | FAISS (`faiss-cpu`) |
+| Numerics | NumPy |
+| Skill / experience / education extraction | Standard library only |
+| Language model | Provider abstraction; offline deterministic default, optional Anthropic API |
+| API | FastAPI, Pydantic v2 |
+| ASGI server | Uvicorn |
+| Dashboard | Streamlit, with Altair and pandas (both arrive with Streamlit) |
+| HTTP client | httpx |
+| Tests | pytest |
 
-All Phase 3 extraction is deterministic string matching. No model is involved.
+Ten direct dependencies, all pinned in `requirements.txt`. The Anthropic SDK and
+LangChain are optional and not installed by default.
 
-## Phase 4 scope — LLM + RAG
+---
 
-- Chunk resumes and index the chunks for retrieval.
-- Retrieve the passages relevant to a job description, per candidate.
-- Build a grounded prompt from job description + Phase 3 profile + evidence.
-- Call an LLM through a provider abstraction (offline default, no key needed).
-- Parse the response into a typed `CandidateAnalysis`.
-- Validate every claim against the deterministic profile and correct it.
-- Keep the supporting evidence attached to the analysis.
-
-## Phase 5 scope — REST API
-
-- Expose the existing pipeline over HTTP with FastAPI.
-- Validate every request and response with Pydantic models.
-- Return consistent, non-leaking errors with useful status codes.
-- Parse and index resumes once, not per request.
-- Serve generated OpenAPI/Swagger documentation.
-- Keep the CLI working unchanged.
-
-## Phase 6 scope — recruiter dashboard
-
-- A Streamlit front end that talks to the API over HTTP and nothing else.
-- Job description input, multi-file PDF upload, ranking, candidate detail.
-- Matched skills, gaps, experience, education, AI summary and evidence.
-- Filtering, sorting and two charts that answer real questions.
-- Loading, empty, success, error and API-unavailable states throughout.
-- A design system and accessibility pass from the `ui-ux-pro-max` skill.
-
-## Project structure
+## Repository structure
 
 ```
-resume-screening-ai/
-│
+.
 ├── app/
-│   ├── __init__.py
-│   ├── resume_parser.py     # Phase 1: PDF validation, extraction, normalization
-│   ├── embeddings.py        # Phase 2: Sentence Transformers wrapper
-│   ├── vector_store.py      # Phase 2: FAISS index + metadata
-│   ├── matching.py          # Phase 2: ranking engine
-│   ├── skill_taxonomy.py    # Phase 3: configurable skill vocabulary
-│   ├── skill_extractor.py   # Phase 3: skill extraction and comparison
-│   ├── experience_extractor.py  # Phase 3: stated years of experience
-│   ├── education_extractor.py   # Phase 3: degree extraction
-│   ├── candidate_analyzer.py    # Phase 3: builds CandidateProfile records
-│   ├── chunker.py           # Phase 4: deterministic resume chunking
-│   ├── retriever.py         # Phase 4: per-candidate FAISS retrieval
-│   ├── rag_context.py       # Phase 4: assembles the grounded context
-│   ├── prompts.py           # Phase 4: prompt templates + grounding rules
-│   ├── llm.py               # Phase 4: provider abstraction
-│   ├── analysis_parser.py   # Phase 4: parses + validates LLM output
-│   ├── rag_pipeline.py      # Phase 4: end-to-end orchestration
-│   ├── models.py            # Typed records shared across phases
-│   ├── main.py              # CLI: extract / match / analyze / rag subcommands
-│   └── api/                 # Phase 5: REST layer over everything above
-│       ├── main.py          #   app factory + metadata (uvicorn entry point)
-│       ├── routes.py        #   endpoints; delegate only
-│       ├── schemas.py       #   Pydantic request/response models
-│       ├── service.py       #   cached pool, indexes and candidate lookup
-│       ├── dependencies.py  #   shared FastAPI dependencies
-│       ├── config.py        #   settings read from the environment
-│       └── errors.py        #   consistent error responses
-│   └── ui/                  # Phase 6: Streamlit dashboard (an API client)
-│       ├── dashboard.py     #   entry point: streamlit run app/ui/dashboard.py
-│       ├── pages.py         #   the four screens
-│       ├── components.py    #   badges, cards, evidence blocks, charts, states
-│       ├── api_client.py    #   the only module that speaks HTTP
-│       ├── formatting.py    #   pure display helpers
-│       ├── state.py         #   session state and invalidation
-│       ├── theme.py         #   design tokens + stylesheet
-│       └── config.py        #   settings from the environment
+│   ├── api/                     FastAPI layer
+│   │   ├── main.py              application factory; uvicorn entry point
+│   │   ├── routes.py            endpoints
+│   │   ├── schemas.py           request/response models
+│   │   ├── service.py           cached pool, indexes, candidate lookup
+│   │   ├── dependencies.py      shared FastAPI dependencies
+│   │   ├── config.py            settings from the environment
+│   │   └── errors.py            consistent error responses
+│   │
+│   ├── ui/                      Streamlit layer (an API client)
+│   │   ├── dashboard.py         streamlit entry point
+│   │   ├── pages.py             the five screens
+│   │   ├── components.py        cards, badges, charts, states
+│   │   ├── api_client.py        the only module that speaks HTTP
+│   │   ├── formatting.py        display helpers
+│   │   ├── state.py             session state
+│   │   ├── theme.py             design tokens and stylesheet
+│   │   └── config.py            settings from the environment
+│   │
+│   ├── resume_parser.py         PDF to text
+│   ├── embeddings.py            text to vectors
+│   ├── vector_store.py          FAISS index plus metadata
+│   ├── matching.py              candidate ranking
+│   │
+│   ├── skill_taxonomy.py        skill vocabulary
+│   ├── skill_extractor.py       skill extraction and comparison
+│   ├── experience_extractor.py  stated years of experience
+│   ├── education_extractor.py   degrees
+│   ├── candidate_analyzer.py    builds candidate profiles
+│   │
+│   ├── chunker.py               resume chunking
+│   ├── retriever.py             per-candidate chunk retrieval
+│   ├── rag_context.py           grounded context assembly
+│   ├── prompts.py               prompt templates and grounding rules
+│   ├── llm.py                   provider abstraction
+│   ├── analysis_parser.py       parses and validates model output
+│   ├── rag_pipeline.py          end-to-end orchestration
+│   │
+│   ├── models.py                shared records
+│   └── main.py                  command-line interface
 │
 ├── data/
-│   ├── resumes/             # Put your PDFs here (git-ignored)
-│   └── job_descriptions/    # Sample job descriptions (committed, fictional)
+│   ├── job_descriptions/        sample descriptions (committed, fictional)
+│   └── resumes/                 candidate PDFs (contents git-ignored)
 │
 ├── scripts/
-│   └── generate_sample_data.py   # Writes synthetic sample resumes
+│   └── generate_sample_data.py  writes fictional sample resumes
 │
-├── tests/
-│   ├── conftest.py          # Fixtures + offline FakeEmbedder
-│   ├── test_resume_parser.py
-│   ├── test_main.py
-│   ├── test_embeddings.py
-│   ├── test_vector_store.py
-│   ├── test_matching.py
-│   ├── test_skill_taxonomy.py
-│   ├── test_skill_extractor.py
-│   ├── test_experience_extractor.py
-│   ├── test_education_extractor.py
-│   ├── test_candidate_analyzer.py
-│   ├── test_chunker.py
-│   ├── test_retriever.py
-│   ├── test_rag_context.py
-│   ├── test_llm.py
-│   ├── test_analysis_parser.py
-│   ├── test_rag_pipeline.py
-│   ├── test_real_llm.py     # opt-in, needs credentials
-│   ├── test_api_health.py
-│   ├── test_api_candidates.py
-│   ├── test_api_matching.py
-│   ├── test_api_analysis.py
-│   ├── test_api_upload.py
-│   ├── test_api_errors.py
-│   ├── test_api_service.py
-│   ├── test_api_upload_store.py
-│   ├── test_ui_api_client.py
-│   ├── test_ui_formatting.py
-│   ├── test_ui_state.py
-│   ├── test_ui_app.py       # renders the real app via Streamlit AppTest
-│   ├── test_integration.py
-│   └── test_integration_phase3.py
-│
-├── .streamlit/
-│   └── config.toml          # Streamlit base theme
-├── .run/                    # pids + service logs (git-ignored)
-├── start_app.ps1            # start API + dashboard
-├── stop_app.ps1             # stop only what start_app started
-├── .gitignore
-├── .env.example
+├── tests/                       1321 tests
+├── .streamlit/config.toml       dashboard base theme
+├── start_app.ps1                start both services
+├── stop_app.ps1                 stop both services
+├── .env.example                 documented configuration template
+├── requirements.txt
 ├── pytest.ini
-├── README.md
-└── requirements.txt
+└── README.md
 ```
+
+---
+
+## Prerequisites
+
+- **Python 3.11 or newer.** Check with `python --version`.
+- **pip**, included with Python.
+- **Git**, to clone the repository.
+- **About 2 GB of disk space.** Installing dependencies pulls in PyTorch, and
+  the embedding model adds another ~90 MB on first run.
+- **Internet access for the first run only** — to install packages and download
+  the embedding model. Everything works offline afterwards.
+- **Windows PowerShell** for the start/stop scripts. The application itself is
+  cross-platform; only those two scripts are Windows-specific.
+
+No API key, database, container runtime or external service is required.
+
+---
 
 ## Installation
 
-Requires Python 3.10 or newer.
+### 1. Clone and enter the repository
 
-### 1. Create a virtual environment
+```powershell
+git clone <repository-url>
+cd "LLM-Powered Resume Screening & Candidate Matching System"
+```
 
-Windows (PowerShell):
+### 2. Create and activate a virtual environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-macOS / Linux:
+Your prompt should now begin with `(.venv)`. If activation is blocked, see
+[If PowerShell blocks the script](#if-powershell-blocks-the-script).
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
+`.venv/` is git-ignored.
 
-> **Windows path-length note.** Phase 2 pulls in PyTorch, which ships files
-> nested deeply enough to exceed the legacy 260-character `MAX_PATH` limit. If
-> `pip install` fails with `[WinError 206] The filename or extension is too
-> long`, either enable long paths
-> (`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1`,
-> needs admin) or create the virtual environment somewhere short, such as
-> `python -m venv C:\venvs\rsai`.
+> **Windows path length.** If installation fails with `[WinError 206] The
+> filename or extension is too long`, the culprit is PyTorch's deeply nested
+> files under a long project path. Either enable long paths
+> (`Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1`,
+> as Administrator, then reboot), or create the virtual environment somewhere
+> shorter, for example `python -m venv C:\venvs\resume-screening`.
 
-### 2. Install dependencies
+### 3. Install dependencies
 
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-This installs PyTorch and roughly 1.5 GB of packages. The first `match` run also
-downloads the embedding model (~90 MB) into the Hugging Face cache
-(`~/.cache/huggingface`); later runs are offline.
+This installs roughly 1.5 GB of packages, PyTorch being most of it.
 
-### 3. Optional environment file
+### 4. Configure (optional)
 
-No secrets are needed. The template documents the resume directory, the
-embedding model, the optional LLM provider and the API settings:
-
-```bash
-cp .env.example .env      # Windows: copy .env.example .env
+```powershell
+copy .env.example .env
 ```
+
+Every setting has a working default, so this step is optional. See
+[Configuration](#configuration).
+
+### 5. Generate sample data
+
+```powershell
+python scripts\generate_sample_data.py
+```
+
+Writes nine fictional resumes into `data/resumes/`. Skip this if you intend to
+upload your own.
+
+### 6. Verify the installation
+
+```powershell
+python -m pytest
+```
+
+Expect `1316 passed, 5 skipped`. The first run is slower because one test group
+loads the embedding model.
+
+---
+
+## Configuration
+
+Every variable is optional; the project runs with no configuration at all.
+`.env.example` documents each one with its default.
+
+`start_app.ps1` loads `.env` into the environment before starting the services.
+Nothing else reads the file — the application reads environment variables — so
+when starting a service by hand, set variables in your shell instead:
+
+```powershell
+$env:LLM_PROVIDER = "anthropic"
+python -m uvicorn app.api.main:app --reload
+```
+
+A value already set in the shell always takes precedence over `.env`.
+
+| Variable | Required | Purpose | Default |
+| --- | --- | --- | --- |
+| `RESUME_DIR` | No | Directory scanned for candidate PDFs | `data/resumes` |
+| `EMBEDDING_MODEL` | No | Sentence Transformers model id | `sentence-transformers/all-MiniLM-L6-v2` |
+| `LLM_PROVIDER` | No | `fake`, `anthropic` or `langchain` | `fake` |
+| `LLM_MODEL` | No | Model id for the chosen provider | `claude-opus-5` |
+| `LLM_API_KEY` | Only for `anthropic` | API key; `ANTHROPIC_API_KEY` also accepted | *(empty)* |
+| `LLM_MAX_TOKENS` | No | Response cap | `4096` |
+| `API_CORS_ORIGINS` | No | Allowed browser origins, comma separated | dashboard on 8501 |
+| `API_MAX_UPLOAD_BYTES` | No | Upload size ceiling | `5242880` (5 MB) |
+| `API_LOG_LEVEL` | No | Level for the application logger | `INFO` |
+| `API_BASE_URL` | No | Where the dashboard looks for the API | `http://127.0.0.1:8000` |
+| `API_TIMEOUT_SECONDS` | No | Timeout for ordinary API calls | `30` |
+| `API_ANALYSIS_TIMEOUT_SECONDS` | No | Timeout for analysis calls | `180` |
+| `UI_DEFAULT_TOP_K` | No | Candidates the ranking asks for | `10` |
+
+**`.env` must never be committed.** It is git-ignored, and it is where a real
+key would live. `.env.example` is committed and must stay free of credentials.
+
+### Using a real language model
+
+Candidate analysis runs offline by default against a deterministic provider that
+needs no key. Its output is labelled `fake/deterministic-v1` so it is never
+mistaken for model prose. To use the Anthropic API instead:
+
+```powershell
+pip install anthropic==1.0.0
+
+# In .env (git-ignored), or in your shell:
+$env:LLM_PROVIDER = "anthropic"
+$env:LLM_API_KEY  = "sk-ant-..."
+
+.\start_app.ps1
+```
+
+Only candidate analysis uses the model. Parsing, ranking and extraction never
+do, so they stay free and offline regardless.
+
+LangChain is supported from Python: `app/llm.py` provides `LangChainProvider`,
+which wraps any LangChain chat model. Nothing imports LangChain unless you
+choose to use it.
+
+---
+
+## Running and stopping
+
+### With the scripts
+
+```powershell
+.\start_app.ps1                              # default ports 8000 and 8501
+.\start_app.ps1 -ApiPort 8100 -UiPort 8600   # different ports
+.\stop_app.ps1
+```
+
+`start_app.ps1`:
+
+- finds a usable Python — `$env:PYTHON`, then an active virtual environment,
+  then `.venv` in the project, then `python` on `PATH`;
+- loads `.env` if present;
+- verifies the required packages are importable, and stops with an actionable
+  message if they are not;
+- starts both services, waits for each to answer a health check, and prints the
+  URLs;
+- is safe to run twice — a service already up is reported and left alone;
+- refuses to start a service whose port is held by something else, and tells you
+  which port to change.
+
+`stop_app.ps1` stops **only** what `start_app.ps1` started. It records each
+process id and its start time in `.run/`, and verifies both before stopping
+anything, because Windows reuses process ids. It stops child processes first —
+`uvicorn --reload` runs the application in a child that would otherwise be
+orphaned holding the port. It never matches processes by image name, so it
+cannot touch another project's Python, and it is safe to run when nothing is
+running.
+
+Logs and process state live in `.run/`, which is git-ignored.
+
+### By hand
+
+See [If the scripts do not work at all](#if-the-scripts-do-not-work-at-all).
+
+### The command line
+
+The same pipeline is available without either service:
+
+```powershell
+python -m app.main extract data\resumes\sarah_wilson.pdf
+python -m app.main match   --job-description data\job_descriptions\financial_analyst.txt
+python -m app.main analyze --job-description data\job_descriptions\financial_analyst.txt
+python -m app.main rag     --job-description data\job_descriptions\financial_analyst.txt
+```
+
+---
+
+## Using the application
+
+### Uploading resumes
+
+On **Screening → Candidate pool**, select one or more PDFs and add them. Each
+file is streamed to the API, validated and parsed; only files that parse are
+kept. The response reports how much text was extracted.
+
+- **PDF only**, checked by file extension *and* by the leading `%PDF` bytes.
+- **Size-capped** at `API_MAX_UPLOAD_BYTES` (5 MB by default), enforced while
+  streaming, so an oversized file is abandoned rather than buffered.
+- **Text-based PDFs only.** A scanned image has no selectable text and is
+  rejected with that explanation. There is no OCR.
+- **The stored name is generated**, never taken from the upload: the submitted
+  name is reduced to a slug of `[a-z0-9_]`, which becomes the candidate id.
+  `Sarah Wilson (CV).pdf` becomes `sarah_wilson_cv`. Re-uploading a file whose
+  name reduces to the same id replaces the earlier one.
+
+Uploads are stored on the machine running the API, in `RESUME_DIR`. Contents of
+that directory are git-ignored.
+
+### Managing the pool
+
+The **Resumes** page lists everything stored, and offers:
+
+- **Remove** on any row — deletes that resume immediately.
+- **Multi-select removal** — tick several, remove them in one call. One failure
+  does not abandon the rest; each is reported.
+- **Clear resume pool** — deletes every stored resume, behind a confirmation.
+  Only files that are currently pooled candidates are touched; anything else in
+  the directory is left alone.
+
+Deletion is permanent: the file is unlinked, and there is no undo.
+
+Removing a resume drops the cached pool and both FAISS indexes on the server, so
+the candidate stops appearing in rankings and can no longer be analysed. In the
+dashboard it also drops that candidate's analysis and the whole ranking, whose
+ranks and totals described a pool that has now changed. The job description
+survives — deleting a resume is not abandoning the role.
+
+**New screening session** clears the job description, the ranking, the analyses
+and the selection, and **keeps every resume**. The pool is shared across
+sessions; emptying it is the separate, confirmed action above.
+
+### Matching
+
+Paste a job description, choose how many candidates to rank, and rank. The API
+embeds the description and compares it against the resume index, returning
+candidates ordered by cosine similarity. Resumes are parsed and embedded once
+and reused, so repeat rankings only re-embed the description — a few tens of
+milliseconds.
+
+The ranked table carries rank, name, similarity, a word for the similarity band,
+skill coverage, experience status and recommendation. The last three read *Not
+analyzed yet* until that candidate has been analysed. Search, filter by
+recommendation, filter by minimum similarity, and sort by any of four orders.
+
+### Analysis
+
+Analysis is separate from ranking because it costs a model call per candidate.
+Choose how many of the top candidates to analyse; already-analysed candidates
+are skipped.
+
+For each one the system retrieves the passages of that candidate's resume
+closest to the role, assembles them with the extracted profile into a prompt,
+calls the model, and validates the response. The candidate detail view shows the
+four measures, matched skills and gaps, experience, education, the written
+summary, and the retrieved passages.
+
+Evidence and generated text are rendered differently on purpose: retrieved
+resume text is monospaced on a tinted ground behind a solid rule and labelled
+*From resume*; the model's prose sits on a white card behind a dashed rule
+labelled *AI-generated interpretation*, with the model name beneath it.
+
+---
+
+## API
+
+Base URL `http://127.0.0.1:8000` by default. Interactive documentation is served
+at **`/docs`** (Swagger UI) and **`/redoc`** (ReDoc); the raw schema is at
+`/openapi.json`.
+
+Every error uses the same shape:
+
+```json
+{ "detail": "Only PDF files are supported.", "code": "unsupported_file_type" }
+```
+
+A `422` adds an `errors` array naming the offending fields. Tracebacks,
+filesystem paths and internal exception text are never returned.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The request or the file is unusable |
+| `404` | Unknown candidate, or the resume directory is missing or empty |
+| `413` | Upload exceeds `API_MAX_UPLOAD_BYTES` |
+| `422` | Request validation failed |
+| `500` | Unexpected server-side failure |
+| `502` | The language model provider failed or returned something unusable |
+
+### `GET /health`
+
+Liveness. Loads no model and reads no resume.
+
+```json
+{ "status": "healthy", "service": "resume-screening-api",
+  "version": "0.1.0", "llm_provider": "fake" }
+```
+
+Never reveals whether a key is configured.
+
+### `GET /candidates`
+
+Lists the pool. Files that could not be parsed appear under `unreadable` rather
+than being silently omitted.
+
+```json
+{ "candidates": [ { "candidate_id": "sarah_wilson", "name": "Sarah Wilson",
+                    "filename": "sarah_wilson.pdf", "text_length": 1987 } ],
+  "count": 1, "unreadable": [] }
+```
+
+An existing but empty directory returns an empty list. A missing directory is a
+`404` (`resume_directory_not_found`).
+
+### `POST /upload-resume`
+
+`multipart/form-data`. Fields: `file` (the PDF, required) and `store` (boolean,
+default `false`).
+
+With `store=false` the file is parsed and discarded. With `store=true` it is kept
+as a rankable candidate — this is what the dashboard sends.
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/upload-resume `
+  -F "file=@data/resumes/sarah_wilson.pdf" -F "store=true"
+```
+
+```json
+{ "filename": "sarah_wilson.pdf", "status": "success", "text_length": 1987,
+  "word_count": 269, "preview": "Sarah Wilson\nSenior Financial Analyst...",
+  "stored": true, "candidate_id": "sarah_wilson" }
+```
+
+Common errors: `400 unsupported_file_type` (not a PDF), `400 invalid_pdf`
+(corrupt), `400 no_extractable_text` (scanned image), `400 empty_file`,
+`413 payload_too_large`, `422` (no file supplied).
+
+### `POST /match-candidates`
+
+```json
+{ "job_description": "Financial analyst with 3+ years...", "top_k": 5 }
+```
+
+`top_k` is optional, defaults to `5`, and must be between 1 and 100.
+
+```json
+{ "results": [ { "rank": 1, "candidate": "Sarah Wilson",
+                 "candidate_id": "sarah_wilson", "similarity_score": 0.5129 } ],
+  "count": 1, "candidates_considered": 9,
+  "score_type": "cosine_similarity", "score_note": "..." }
+```
+
+`similarity_score` is the raw cosine value. `score_note` carries the explanation
+of what it is not, so a client cannot display the number without it.
+
+Common errors: `422` (empty or missing job description, `top_k` out of range),
+`404 no_resumes` (empty pool), `404 resume_directory_not_found`.
+
+### `POST /analyze-candidate`
+
+```json
+{ "candidate": "sarah_wilson", "job_description": "Financial analyst..." }
+```
+
+`candidate` may be a candidate id, a display name or a resume file name. It is
+resolved against the pool and never treated as a path; a value containing `/`,
+`\` or a null byte is rejected with `422`.
+
+The response carries `recommendation`, `summary`, `matched_skills`,
+`skill_gaps`, `experience_assessment`, `education`, `evidence`, `limitations`,
+`warnings`, `is_grounded` and `model`.
+
+The request has no field through which a client could supply skills, experience
+or evidence, so it cannot bypass the grounding checks.
+
+Common errors: `404 candidate_not_found`, `422` (blank fields, path-shaped
+candidate), `502 llm_call_failed`, `502 llm_response_invalid`.
+
+This is the slowest endpoint — it makes one model call. Allow for that in client
+timeouts.
+
+### `DELETE /candidates/{candidate_id}`
+
+Removes one candidate and refreshes the pool. The path parameter is resolved
+against the pool, never used to build a filesystem path.
+
+```json
+{ "deleted": ["james_patel"], "failed": [], "remaining": 8 }
+```
+
+Common error: `404 candidate_not_found`.
+
+### `POST /candidates/delete`
+
+Removes several. A `POST` rather than a `DELETE` because it carries a body, which
+many HTTP clients and proxies will not send on a `DELETE`.
+
+```json
+{ "candidates": ["james_patel", "nina_volkov"] }
+```
+
+One failure does not abandon the batch: `deleted` names what went, `failed` says
+what stayed and why.
+
+### `DELETE /candidates`
+
+Empties the pool. Only files that are currently pooled candidates are deleted.
+Clearing an already-empty pool is not an error.
+
+---
+
+## Tests
+
+```powershell
+python -m pytest                 # everything; runs offline
+python -m pytest -q              # quieter
+python -m pytest tests\test_api_matching.py      # one file
+python -m pytest -m "not model"  # skip tests that load the embedding model
+python -m pytest -m model        # only those tests
+python -m pytest -m llm          # only tests needing a real model provider
+```
+
+Expected result: **1316 passed, 5 skipped**.
+
+### Why five tests skip
+
+The five skipped tests live in `tests/test_real_llm.py` and are marked `llm`.
+They exercise the real Anthropic provider, so they need credentials and the
+optional SDK, and they skip themselves with this reason:
+
+```
+no real LLM configured; set LLM_PROVIDER=anthropic and LLM_API_KEY
+(and pip install anthropic) to run these
+```
+
+Skipping is the designed behaviour, not a failure: the suite must pass with no
+key and no network. To run them, install `anthropic`, set `LLM_PROVIDER` and
+`LLM_API_KEY`, and run `python -m pytest -m llm`. Doing so makes real API calls,
+which cost money.
+
+Two markers are declared in `pytest.ini`:
+
+- `model` — needs the real Sentence Transformers weights; downloads on first
+  run and skips if unavailable.
+- `llm` — needs a real provider and credentials.
+
+The rest of the suite runs against a deterministic bag-of-words embedder and the
+offline model provider, so it is fast, offline and reproducible. No test opens a
+socket, needs a key, or touches your real `data/resumes/` directory.
+
+---
+
+## Local data and version control
+
+| Path | Committed? | What it is |
+| --- | --- | --- |
+| `app/`, `tests/`, `scripts/` | Yes | Source code |
+| `data/job_descriptions/` | Yes | Fictional sample job descriptions |
+| `data/resumes/.gitkeep` | Yes | Keeps the directory; its contents are ignored |
+| `data/resumes/*.pdf` | **No** | Uploaded and generated resumes — may contain personal data |
+| `.streamlit/config.toml` | Yes | Dashboard base theme; project configuration |
+| `.env.example` | Yes | Configuration template, no credentials |
+| `.env` | **No** | Your local configuration, including any API key |
+| `.venv/` | **No** | Virtual environment |
+| `.run/` | **No** | Process ids and service logs from `start_app.ps1` |
+| `.claude/` | **No** | Local editor tooling |
+| `__pycache__/`, `.pytest_cache/` | **No** | Generated caches |
+
+Resume PDFs are never committed. Real resumes contain personal data, so
+`data/resumes/` keeps only a `.gitkeep`, and everything in it is ignored. The
+bundled sample resumes are fictional and are generated locally by
+`scripts/generate_sample_data.py` rather than stored in the repository.
+
+To reset your local pool, delete the PDFs and regenerate:
+
+```powershell
+Remove-Item data\resumes\*.pdf
+python scripts\generate_sample_data.py
+```
+
+---
+
+## Troubleshooting
+
+**`uvicorn is not recognized` / `streamlit is not recognized`**
+The console scripts are not on your `PATH`, usually because the virtual
+environment is not active. Activate it, or use the module form, which does not
+depend on `PATH` at all:
+
+```powershell
+python -m uvicorn app.api.main:app --reload
+python -m streamlit run app/ui/dashboard.py
+```
+
+**`ModuleNotFoundError: No module named 'fastapi'` (or `streamlit`, `fitz`, `faiss`)**
+Dependencies are missing from the interpreter you are using. Activate the
+virtual environment and install:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Confirm you are using the right interpreter with `python -c "import sys; print(sys.executable)"`.
+
+**Virtual environment not activated**
+Your prompt does not start with `(.venv)`. Run `.\.venv\Scripts\Activate.ps1`
+from the project root. Each new terminal needs its own activation.
+
+**`cannot be loaded because running scripts is disabled on this system`**
+PowerShell's execution policy. Allow scripts for this window only:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+**`Port 8000 is in use by something else`**
+`start_app.ps1` refuses to start a service on an occupied port. Either free it,
+or choose another:
+
+```powershell
+.\start_app.ps1 -ApiPort 8100 -UiPort 8600
+```
+
+To see what holds a port:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000 -State Listen |
+  Select-Object OwningProcess
+```
+
+After force-stopping a service, Windows can leave the socket attributed to the
+dead process for a few seconds; wait, then retry.
+
+**Dashboard says `API unreachable`**
+The dashboard is a client and has nothing to show without the API. Check that
+the API is up:
+
+```powershell
+curl.exe http://127.0.0.1:8000/health
+```
+
+If it is running on a different port, tell the dashboard where to look by
+setting `API_BASE_URL` (in `.env` when using `start_app.ps1`, or in the shell
+when starting by hand). Service logs are in `.run/api.log` and `.run/api.log.err`.
+
+**First request is very slow, or times out**
+The first request loads the Sentence Transformers model and, on a fresh
+install, downloads it (~90 MB). Expect up to a minute. Later requests are fast
+because the model and the index stay in memory. The dashboard's analysis
+timeout is 180 seconds by default (`API_ANALYSIS_TIMEOUT_SECONDS`).
+
+**Missing `.env`**
+Not a problem — every setting has a default and the project runs without one.
+Create it only when you want to change something:
+`copy .env.example .env`.
+
+**Missing LLM credentials**
+Also not a problem. Analysis falls back to the offline deterministic provider,
+whose output is labelled `fake/deterministic-v1`. If you set
+`LLM_PROVIDER=anthropic` without a key, or without `pip install anthropic`, the
+API answers with a clear error rather than failing silently.
+
+**An uploaded resume does not appear**
+Check the upload result message — a rejected file says why. Most often the PDF
+is a scanned image with no selectable text, which this system cannot read.
+Confirm what the server holds with:
+
+```powershell
+curl.exe http://127.0.0.1:8000/candidates
+```
+
+Also confirm you are looking at the right directory: the API reads `RESUME_DIR`,
+which defaults to `data/resumes` **relative to where the API process was
+started**.
+
+**A deleted resume still appears in the ranking**
+The ranking in your browser is a snapshot taken before the deletion. Re-rank on
+the Screening page. Server-side, deleting always drops the cached pool and both
+FAISS indexes, so the API itself will not return a deleted candidate.
+
+**Resetting everything**
+
+```powershell
+.\stop_app.ps1
+Remove-Item data\resumes\*.pdf
+Remove-Item .run -Recurse -Force
+python scripts\generate_sample_data.py
+.\start_app.ps1
+```
+
+---
+
+## Security notes
+
+- **No authentication.** Anyone who can reach the ports can use every endpoint,
+  including the one that costs a model call, and can delete resumes. Run it
+  locally; do not expose it to an untrusted network.
+- **No path is ever accepted from a client.** Uploads are written to generated
+  names in `RESUME_DIR`; a candidate reference is looked up in the pool and
+  rejected if it contains `/`, `\` or a null byte; deletion re-checks that the
+  resolved file sits inside the configured directory before unlinking.
+- **Uploads are validated** by extension and by leading bytes, size-capped
+  while streaming, and written to temporary files that are removed in a
+  `finally` block.
+- **Errors reveal nothing internal.** No traceback, filesystem path,
+  environment variable or 5xx exception text reaches a client. Server-side
+  failures are logged in full and answered with a fixed message.
+- **Logs exclude sensitive content.** Endpoints, file names, sizes and outcomes
+  are logged; resume text, candidate details and credentials are not.
+- **Credentials come from the environment only.** Nothing writes a key to disk
+  or logs one. `.env` is git-ignored; `.env.example` contains no real values.
+- **CORS is restricted** to the dashboard's origin by default. `*` is available
+  for development and is documented as such.
+- **Resume data is personal data.** Uploaded PDFs stay on the machine running
+  the API and are never committed. Treat `data/resumes/` accordingly.
+
+---
+
+## Known limitations
+
+**Extraction**
+Scanned or image-only PDFs yield no text; there is no OCR. Multi-column layouts
+extract in PyMuPDF's reading order, which can interleave columns. Skill
+extraction only recognises skills present in its taxonomy, so an unusual
+phrasing or an unlisted technology is missed. Years of experience are read only
+where the resume states them outright — never inferred from employment dates or
+a graduation year.
+
+**Ranking**
+Similarity is a single number from a small embedding model. It cannot filter on
+hard requirements, and it cannot justify a ranking. The embedding model
+truncates at 256 word pieces, which is why retrieval chunks resumes rather than
+embedding them whole. Scores are comparable only within one ranking.
+
+**Analysis**
+Hallucination is reduced, not eliminated. Unsupported skills, invented durations,
+invented degrees and out-of-vocabulary recommendations are caught and corrected.
+Invented employers, projects and achievements are not — there is no ground truth
+to check them against. Fluent, subtly wrong prose can survive. Retrieval can miss
+the passage that would have answered a requirement. The recommendation is a
+coarse label, not a calibrated measurement.
+
+**Operational**
+State is in-process: one server holds one pool in memory, and a second worker
+would hold its own copy. Nothing is persisted beyond the PDFs themselves —
+analyses live in the browser session and are lost on reload. Analysis is
+synchronous, so a request holds a connection for the whole model call, and there
+is no queue and no cancellation. The pool is shared by every user of the
+dashboard, with no per-recruiter workspace, and deletion is permanent with no
+undo. The first request after start-up is slow.
+
+**Fairness**
+Embedding similarity reflects patterns in the model's training data and can
+carry those biases; a generated summary can carry them too. The output is
+intended to order and summarise resumes for a human reviewer, never to screen
+automatically.
+
+---
+
+## Reference
+
+The sections below document each part of the pipeline in depth — what it does,
+why it was built that way, and what it cannot do. They are not needed to run the
+project.
 
 ## Sample data
 
@@ -1044,6 +1780,9 @@ before, with or without the server running.
 | `POST` | `/upload-resume` | Parses one uploaded PDF and reports what was extracted. |
 | `POST` | `/match-candidates` | Ranks the resume pool against a job description. |
 | `POST` | `/analyze-candidate` | Full RAG analysis of one candidate, with evidence. |
+| `DELETE` | `/candidates/{id}` | Remove one candidate and refresh the pool. |
+| `POST` | `/candidates/delete` | Remove several; one failure does not abandon the batch. |
+| `DELETE` | `/candidates` | Empty the pool. |
 
 ### Examples
 
@@ -1226,48 +1965,9 @@ A Streamlit front end over the Phase 5 API. It is a **client**: every number it
 shows arrived over HTTP, and it imports nothing from `app.api` or from the
 Phase 1–4 modules. A test asserts that.
 
-### Running the two services
+### Running it
 
-On Windows, one command starts both:
-
-```powershell
-.\start_app.ps1              # or: .\start_app.ps1 -ApiPort 8100 -UiPort 8600
-.\stop_app.ps1
-```
-
-`start_app.ps1` finds a usable Python (`$env:PYTHON`, an active virtualenv, a
-project `.venv`, then `python` on PATH — no path is hardcoded), checks the
-required packages are installed, starts both services, waits for each to answer
-a health check, and prints the URLs. Running it twice is safe: a service that is
-already up is reported and left alone.
-
-`stop_app.ps1` stops **only** the processes `start_app.ps1` started. It records
-each process id together with its start time in `.run/`, verifies both before
-stopping anything — Windows reuses process ids — and stops child processes
-first, because `uvicorn --reload` runs the application in a child that would
-otherwise be orphaned holding the port. It never matches processes by name, so
-it cannot touch another project's Python. It is safe to run when nothing is
-running.
-
-`.run/` holds the pids and the service logs, and is git-ignored.
-
-Or run them by hand, in two terminals, backend first:
-
-```bash
-uvicorn app.api.main:app --reload      # terminal 1
-streamlit run app/ui/dashboard.py      # terminal 2
-```
-
-Then open <http://localhost:8501>. If the API is somewhere else, point the
-dashboard at it:
-
-```bash
-API_BASE_URL=http://192.168.1.20:8000 streamlit run app/ui/dashboard.py
-```
-
-The dashboard needs no filesystem access of its own — no resume directory, no
-model, no key. If the API is not running it says so and shows how to start it,
-rather than displaying a screen of zeroes.
+See [Running and stopping](#running-and-stopping) at the top of this file.
 
 ### The workflow
 
@@ -1299,6 +1999,29 @@ operations, and the label says so rather than implying a failure.
 **Candidate** — the full picture for one person: similarity, recommendation,
 grounding status, matched skills, gaps, experience, education, the AI summary,
 and the retrieved evidence.
+
+**Resumes** — the stored pool: every resume on the server, with per-row removal,
+multi-select removal, and a confirmed *Clear resume pool*. Also where a new
+screening session is started.
+
+### Sessions and the pool are different things
+
+The **pool** lives on the server and persists. A **session** is one role — the
+job description, the ranking and the analyses produced for it — and lives in the
+browser tab.
+
+*New screening session* clears the session and keeps every resume, because a
+recruiter moving to the next vacancy still wants their candidates. Emptying the
+pool is a separate action behind a confirmation, on the Resumes page.
+
+Removing a resume invalidates what was derived from it: that candidate's
+analysis is dropped, and the ranking is dropped whole, since its ranks and its
+"considered" count describe a pool that has changed. The job description
+survives — deleting a resume is not abandoning the role.
+
+On the server, a delete drops the cached pool **and both FAISS indexes**. An
+index outlives the files it was built from, so without that a deleted candidate
+would keep appearing in rankings and keep being analysable.
 
 Changing the job description clears the ranking and every analysis. They were
 produced for a different role, and leaving them on screen under a new heading
@@ -1428,49 +2151,9 @@ backend = matcher.match("Senior Python backend engineer")
 ml_role = matcher.match("NLP engineer, PyTorch and embeddings")
 ```
 
-## Running the tests
+## Limitations in detail
 
-```bash
-pytest                       # everything that runs offline
-pytest tests/test_api_*.py   # just the REST API suites
-pytest tests/test_ui_*.py    # just the dashboard suites
-pytest -m "not model"        # skip even the embedding-model tests
-pytest -m model              # only tests using real embedding weights
-pytest -m llm                # only tests calling a real LLM (needs credentials)
-```
-
-The default run needs **no API key and no network**: the LLM tests are marked
-`llm` and skip unless `LLM_PROVIDER`/`LLM_API_KEY` are set, and Phase 4 itself
-defaults to an offline deterministic provider.
-
-Most tests run against a deterministic bag-of-words `FakeEmbedder` defined in
-`tests/conftest.py`, so the suite is fast, offline, and reproducible. Depending
-on real transformer weights everywhere would make it slow and network-bound, and
-floating-point output can shift between model revisions. The fake still produces
-genuine cosine similarities — texts sharing vocabulary score higher — so the
-ranking assertions test real logic.
-
-Tests that must exercise the actual model are marked `model` and **skip
-automatically** when the weights cannot be loaded, so the suite still passes on a
-machine with no network access.
-
-The API suites use FastAPI's `TestClient` against an app whose service
-dependency is overridden to point at a temporary resume directory, the offline
-embedder and the offline LLM provider. No API test downloads model weights,
-touches `data/resumes/`, opens a socket, or needs a key.
-
-The dashboard suites do the same one layer up. `test_ui_api_client.py` serves
-responses through an `httpx` mock transport, and `test_ui_app.py` runs the real
-Streamlit script through `AppTest` with the API client replaced by a stub — so
-every screen a recruiter can reach is actually rendered, including the empty,
-error and API-unavailable ones. No browser, no server, no model.
-
-Test PDFs are generated at runtime with PyMuPDF, so no binary fixtures are
-committed. The Phase 3 suites need neither a model nor a network: skill,
-experience and education extraction are pure string matching, so they are
-tested directly.
-
-## Limitations
+Expanding on [Known limitations](#known-limitations) above.
 
 ### Resume parsing
 
@@ -1610,8 +2293,9 @@ reported as unknown.
   server-side resume directory and sees the same candidates. There is no
   per-recruiter workspace, so two people screening different roles at once will
   see each other's uploads.
-- **Uploads accumulate.** There is no delete: a resume added to the pool stays
-  until it is removed from the directory by hand. A demo pool fills up quickly.
+- **The pool is shared, and deletion is permanent.** Anyone using the dashboard
+  can remove anyone's resume, and there is no undo or recycle bin — the file is
+  unlinked. Only files that are currently pooled candidates are ever touched.
 - **A re-upload replaces.** Two different people whose file names reduce to the
   same id — `sarah_wilson.pdf` and `Sarah Wilson.pdf` — become one candidate,
   and the second overwrites the first.

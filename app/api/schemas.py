@@ -39,6 +39,8 @@ __all__ = [
     "CandidateSummary",
     "UnreadableResume",
     "CandidateListResponse",
+    "DeleteCandidatesRequest",
+    "DeleteCandidatesResponse",
     "ErrorResponse",
     "ValidationErrorItem",
     "ValidationErrorResponse",
@@ -48,6 +50,9 @@ __all__ = [
 MAX_JOB_DESCRIPTION_CHARS = 20_000
 MAX_TOP_K = 100
 MAX_CANDIDATE_REF_CHARS = 200
+
+# A delete batch larger than this is not a recruiter tidying up a pool.
+MAX_DELETE_BATCH = 500
 
 # How much extracted text POST /upload-resume echoes back, so a caller can see
 # that extraction worked without the endpoint returning the whole resume.
@@ -301,6 +306,52 @@ class CandidateListResponse(BaseModel):
         default_factory=list,
         description="Files that were skipped, so a missing candidate is visible rather than silent.",
     )
+
+
+class DeleteCandidatesRequest(BaseModel):
+    """Which pooled candidates to remove.
+
+    Each entry names a candidate the server already holds -- an id, a display
+    name, or a resume file name. It is looked up in the pool, never treated as
+    a path, so this cannot reach a file the pool does not contain.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"candidates": ["sarah_wilson", "james_patel"]}}
+    )
+
+    candidates: list[str] = Field(
+        min_length=1,
+        max_length=MAX_DELETE_BATCH,
+        description="Candidate ids, display names, or resume file names.",
+    )
+
+    @field_validator("candidates")
+    @classmethod
+    def _references_are_not_paths(cls, value: list[str]) -> list[str]:
+        for item in value:
+            _require_content(item, "candidates")
+            if any(char in item for char in _UNSAFE_REFERENCE_CHARS):
+                raise ValueError(
+                    "a candidate must be an id or a name, not a path; "
+                    "remove any '/', '\\' or null characters"
+                )
+        return value
+
+
+class DeleteCandidatesResponse(BaseModel):
+    """What a delete actually removed.
+
+    One failure does not abandon the batch, so both lists can be non-empty:
+    ``deleted`` names what went, ``failed`` says what stayed and why.
+    """
+
+    deleted: list[str] = Field(description="Ids of the candidates that were removed.")
+    failed: list[str] = Field(
+        default_factory=list,
+        description="Entries that could not be removed, each with the reason.",
+    )
+    remaining: int = Field(description="How many candidates the pool still holds.")
 
 
 class ErrorResponse(BaseModel):

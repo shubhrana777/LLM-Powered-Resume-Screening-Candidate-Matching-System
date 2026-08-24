@@ -73,6 +73,7 @@ __all__ = [
     "render_screening",
     "render_ranking",
     "render_candidate",
+    "render_resumes",
     "render_page",
     "build_ranking_rows",
 ]
@@ -1065,6 +1066,287 @@ def _render_evidence(analysis: Mapping[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resume pool management
+# ---------------------------------------------------------------------------
+
+
+def render_resumes(
+    client: ScreeningAPIClient,
+    state: MutableMapping[str, Any],
+    pool: Mapping[str, Any],
+) -> None:
+    """Render the resume pool: what is stored, and how to remove it.
+
+    The pool is server-side and shared across screening sessions, so it is
+    managed on its own page rather than buried in the screening flow. Two
+    destructive actions live here, and they are deliberately different in
+    weight: removing selected resumes is one click, emptying the pool takes a
+    confirmation.
+
+    Args:
+        client: The API client.
+        state: Session state.
+        pool: The ``GET /candidates`` response.
+    """
+    masthead(
+        "Resumes",
+        "The candidate pool stored on the server. It persists across screening "
+        "sessions until you remove something here.",
+    )
+
+    candidates = list(pool.get("candidates") or [])
+    unreadable = list(pool.get("unreadable") or [])
+
+    stat_cards(
+        [
+            ("Stored resumes", str(len(candidates)), "Available to rank and analyse."),
+            (
+                "Unreadable files",
+                str(len(unreadable)) if unreadable else "0",
+                "In the directory but not parseable, so not candidates.",
+            ),
+            (
+                "Analyzed this session",
+                str(ui_state.analysed_count(state)) if ui_state.analysed_count(state) else NOT_ANALYZED,
+                "Cleared when you start a new screening session.",
+            ),
+        ]
+    )
+
+    rule()
+    _session_controls(state)
+
+    rule()
+
+    if not candidates:
+        section("Stored resumes")
+        empty_state(
+            "The pool is empty",
+            "Add PDF resumes on the Screening page. They stay here until you remove them.",
+        )
+        _render_unreadable(unreadable)
+        return
+
+    _resume_list(client, state, candidates)
+
+    rule()
+    _clear_pool_controls(client, state, len(candidates))
+
+    _render_unreadable(unreadable)
+
+
+def _session_controls(state: MutableMapping[str, Any]) -> None:
+    """Start a fresh screening session without touching the pool."""
+    section(
+        "Screening session",
+        "A session is one role: the job description, the ranking and the analyses "
+        "produced for it. Starting a new one clears that work and keeps every "
+        "stored resume.",
+    )
+
+    columns = st.columns([2, 3], gap="medium")
+
+    with columns[0]:
+        if st.button("New screening session", type="primary", icon=":material/restart_alt:"):
+            ui_state.new_session(state)
+            ui_state.goto(state, "Screening")
+            st.rerun()
+
+    with columns[1]:
+        job = ui_state.get_job_description(state)
+        if job:
+            st.markdown(
+                f"<p class='rs-note rs-wrap'>Current session: {truncate(job, 140)}</p>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<p class='rs-note'>No role described in this session yet.</p>",
+                unsafe_allow_html=True,
+            )
+        st.caption("Resumes are not deleted. To empty the pool, use Clear resume pool below.")
+
+
+def _resume_list(
+    client: ScreeningAPIClient,
+    state: MutableMapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+) -> None:
+    """List every stored resume, with per-row and multi-select deletion."""
+    section(
+        "Stored resumes",
+        f"{plural(len(candidates), 'resume')} in the pool. Removing one deletes it from "
+        "the server and drops it from any ranking straight away.",
+    )
+
+    selected: list[str] = []
+
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id", ""))
+        columns = st.columns([1, 5, 3, 2], gap="small")
+
+        with columns[0]:
+            if st.checkbox(
+                f"Select {candidate.get('name', candidate_id)}",
+                key=f"select_{candidate_id}",
+                label_visibility="collapsed",
+            ):
+                selected.append(candidate_id)
+
+        with columns[1]:
+            st.markdown(
+                f"<p class='rs-wrap' style='margin:0;font-weight:600'>"
+                f"{candidate.get('name', candidate_id)}</p>"
+                f"<p class='rs-note rs-wrap' style='margin:2px 0 0'>"
+                f"{candidate.get('filename', '')}</p>",
+                unsafe_allow_html=True,
+            )
+
+        with columns[2]:
+            st.markdown(
+                f"<p class='rs-note rs-num' style='margin:6px 0 0'>"
+                f"{candidate.get('text_length', 0):,} characters</p>",
+                unsafe_allow_html=True,
+            )
+
+        with columns[3]:
+            if st.button(
+                "Remove",
+                key=f"delete_{candidate_id}",
+                help=f"Delete {candidate.get('name', candidate_id)} from the pool.",
+            ):
+                _delete(client, state, [candidate_id])
+
+    st.markdown("")
+
+    if selected:
+        st.caption(f"{plural(len(selected), 'resume')} selected.")
+        if st.button(
+            f"Remove {plural(len(selected), 'selected resume')}",
+            type="primary",
+            icon=":material/delete:",
+        ):
+            _delete(client, state, selected)
+    else:
+        st.caption("Tick resumes to remove several at once.")
+
+
+def _clear_pool_controls(
+    client: ScreeningAPIClient,
+    state: MutableMapping[str, Any],
+    count: int,
+) -> None:
+    """The destructive action, behind an explicit confirmation."""
+    section(
+        "Clear resume pool",
+        "Deletes every stored resume from the server. This cannot be undone, and it "
+        "is separate from starting a new screening session.",
+    )
+
+    if not state.get("confirm_clear_pool"):
+        if st.button("Clear resume pool", icon=":material/warning:"):
+            state["confirm_clear_pool"] = True
+            st.rerun()
+        return
+
+    st.warning(
+        f"Delete all {plural(count, 'resume')} from the pool? This cannot be undone.",
+        icon=":material/warning:",
+    )
+
+    columns = st.columns([2, 2, 4], gap="small")
+
+    with columns[0]:
+        if st.button("Yes, delete everything", type="primary"):
+            state["confirm_clear_pool"] = False
+            _clear(client, state)
+
+    with columns[1]:
+        if st.button("Cancel"):
+            state["confirm_clear_pool"] = False
+            st.rerun()
+
+
+def _render_unreadable(unreadable: Sequence[Mapping[str, Any]]) -> None:
+    """Report files that are present but could not be parsed."""
+    if not unreadable:
+        return
+
+    section(
+        "Unreadable files",
+        "Present in the resume directory but not parseable, so they are not "
+        "candidates. Usually a scanned image with no selectable text.",
+    )
+    for item in unreadable:
+        st.markdown(
+            f"<p class='rs-note rs-wrap'><strong>{item.get('filename', 'unknown')}</strong> — "
+            f"{item.get('reason', '')}</p>",
+            unsafe_allow_html=True,
+        )
+
+
+def _delete(
+    client: ScreeningAPIClient,
+    state: MutableMapping[str, Any],
+    candidate_ids: Sequence[str],
+) -> None:
+    """Delete candidates, then forget anything derived from them."""
+    try:
+        if len(candidate_ids) == 1:
+            result = client.delete_candidate(candidate_ids[0])
+        else:
+            result = client.delete_candidates(candidate_ids)
+    except APIClientError as error:
+        _report(error, client.base_url)
+        return
+
+    deleted = list(result.get("deleted") or [])
+    failed = list(result.get("failed") or [])
+
+    # A ranking that included a deleted candidate is no longer describable, and
+    # their analysis is about a resume that no longer exists.
+    ui_state.forget_candidates(state, deleted)
+    _clear_selection_widgets(state, deleted)
+
+    if deleted:
+        st.session_state["_delete_notice"] = (
+            f"Removed {plural(len(deleted), 'resume')} from the pool."
+        )
+    if failed:
+        st.session_state["_delete_failures"] = failed
+
+    st.rerun()
+
+
+def _clear(client: ScreeningAPIClient, state: MutableMapping[str, Any]) -> None:
+    """Empty the pool, then forget everything derived from it."""
+    try:
+        result = client.clear_candidates()
+    except APIClientError as error:
+        _report(error, client.base_url)
+        return
+
+    deleted = list(result.get("deleted") or [])
+    ui_state.forget_candidates(state, deleted)
+    _clear_selection_widgets(state, deleted)
+
+    st.session_state["_delete_notice"] = f"Cleared {plural(len(deleted), 'resume')} from the pool."
+    st.rerun()
+
+
+def _clear_selection_widgets(state: MutableMapping[str, Any], deleted: Sequence[str]) -> None:
+    """Drop the checkbox keys of candidates that no longer exist.
+
+    Streamlit keeps a widget's value under its key until something removes it.
+    Leaving the key behind would carry a tick over to whatever candidate later
+    reused that id.
+    """
+    for candidate_id in deleted:
+        for prefix in ("select_", "delete_"):
+            state.pop(f"{prefix}{candidate_id}", None)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1073,6 +1355,7 @@ RENDERERS = {
     "Screening": render_screening,
     "Ranking": render_ranking,
     "Candidate": render_candidate,
+    "Resumes": render_resumes,
 }
 
 
