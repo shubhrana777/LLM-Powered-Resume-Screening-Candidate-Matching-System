@@ -51,6 +51,7 @@ __all__ = [
     "evidence_block",
     "generated_block",
     "empty_state",
+    "info_panel",
     "error_state",
     "api_unavailable_state",
     "step_indicator",
@@ -294,15 +295,69 @@ def generated_block(text: str, label: str = "AI-generated interpretation") -> No
 # --- States ---------------------------------------------------------------
 
 
-def empty_state(title: str, message: str) -> None:
+# Line-art glyphs for empty states, drawn inline so they need no icon font
+# and no network. Purely decorative -- the heading and message carry the
+# meaning, so a missing icon costs nothing.
+_EMPTY_ICONS: dict[str, str] = {
+    "document": (
+        "<path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/>"
+        "<path d='M14 3v5h5M9 13h6M9 17h6'/>"
+    ),
+    "search": "<circle cx='11' cy='11' r='7'/><path d='M21 21l-4.3-4.3'/>",
+    "ranking": "<path d='M4 20V10M10 20V4M16 20v-7M22 20H2'/>",
+    "person": "<circle cx='12' cy='8' r='4'/><path d='M4 21a8 8 0 0 1 16 0'/>",
+    "analysis": (
+        "<path d='M3 17l5-5 4 4 8-8'/><path d='M16 8h5v5'/>"
+    ),
+}
+
+
+def _icon_svg(name: str) -> str:
+    """Return the inline SVG for an empty-state glyph, or nothing if unknown."""
+    path = _EMPTY_ICONS.get(name)
+    if not path:
+        return ""
+    return (
+        "<div class='rs-empty__icon'><svg viewBox='0 0 24 24' fill='none' "
+        "stroke='currentColor' stroke-width='1.8' stroke-linecap='round' "
+        f"stroke-linejoin='round' aria-hidden='true' focusable='false'>{path}</svg></div>"
+    )
+
+
+def empty_state(title: str, message: str, icon: str = "document") -> None:
     """Render an empty state that says what to do next.
+
+    Every empty screen in the dashboard uses this one component, so a state
+    that has nothing to show still looks deliberate rather than broken.
 
     Args:
         title: Short heading.
         message: What the recruiter should do to fill this screen.
+        icon: Which glyph to show -- one of ``document``, ``search``,
+            ``ranking``, ``person`` or ``analysis``. An unknown name simply
+            renders no icon.
     """
     st.markdown(
-        f"<div class='rs-empty'><h3>{_esc(title)}</h3><p>{_esc(message)}</p></div>",
+        f"<div class='rs-empty'>{_icon_svg(icon)}"
+        f"<h3>{_esc(title)}</h3><p>{_esc(message)}</p></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def info_panel(title: str, body: str = "") -> None:
+    """Render a quiet informational panel.
+
+    Sits between a caption and an alert: it carries something worth reading
+    without claiming that anything has gone wrong, which ``st.info`` implies.
+
+    Args:
+        title: The message itself, in one line.
+        body: Optional second line, e.g. what to do about it.
+    """
+    extra = f"<p class='rs-panel__body'>{_esc(body)}</p>" if body else ""
+    st.markdown(
+        f"<div class='rs-panel'><i class='rs-panel__icon' aria-hidden='true'>i</i>"
+        f"<div><p class='rs-panel__title'>{_esc(title)}</p>{extra}</div></div>",
         unsafe_allow_html=True,
     )
 

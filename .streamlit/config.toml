@@ -11,14 +11,14 @@
 
 [theme]
 base = "light"
-primaryColor = "#0369A1"
-backgroundColor = "#F6F8FA"
+primaryColor = "#2563EB"
+backgroundColor = "#F8FAFC"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#0F172A"
-linkColor = "#075985"
+linkColor = "#1D4ED8"
 borderColor = "#E2E8F0"
 font = "sans-serif"
-baseRadius = "medium"
+baseRadius = "large"
 
 [server]
 # The dashboard forwards resumes to the API rather than keeping them, but the

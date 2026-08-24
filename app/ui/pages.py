@@ -39,6 +39,7 @@ from app.ui.components import (
     evidence_block,
     footnote,
     generated_block,
+    info_panel,
     lead_candidate,
     masthead,
     ranking_chart,
@@ -209,6 +210,7 @@ def render_overview(
                 "No role described yet",
                 "Add a job description on the Screening page to begin. "
                 "Everything else follows from it.",
+                icon="search",
             )
 
         st.markdown("")
@@ -230,7 +232,11 @@ def render_overview(
             if len(candidates) > 6:
                 st.caption(f"And {len(candidates) - 6} more.")
         else:
-            empty_state("No resumes loaded", "Upload PDF resumes on the Screening page.")
+            empty_state(
+                "No resumes loaded",
+                "Upload PDF resumes on the Screening page.",
+                icon="document",
+            )
 
         unreadable = list(pool.get("unreadable") or [])
         if unreadable:
@@ -288,6 +294,7 @@ def _job_description_form(state: MutableMapping[str, Any]) -> None:
             "No role described yet",
             "Paste a job description below. Nothing can be ranked or analysed until "
             "there is a role to score against.",
+            icon="search",
         )
         st.markdown("")
 
@@ -449,11 +456,19 @@ def _run_ranking(
     )
 
     if not ui_state.has_job_description(state):
-        empty_state("Nothing to rank against yet", "Save a job description in step 1 first.")
+        empty_state(
+            "Nothing to rank against yet",
+            "Save a job description in step 1 first.",
+            icon="search",
+        )
         return
 
     if candidate_count == 0:
-        empty_state("No candidates in the pool", "Add at least one PDF resume above.")
+        empty_state(
+            "No candidates in the pool",
+            "Add at least one PDF resume above.",
+            icon="document",
+        )
         return
 
     columns = st.columns([3, 1], gap="medium")
@@ -568,6 +583,7 @@ def render_ranking(
         empty_state(
             "Nothing ranked yet",
             "Save a job description and rank the pool on the Screening page.",
+            icon="ranking",
         )
         st.markdown("")
         if st.button("Go to screening", type="primary"):
@@ -581,6 +597,7 @@ def render_ranking(
             "No candidates matched",
             "The pool is empty, or every resume failed to parse. Add resumes on the "
             "Screening page.",
+            icon="document",
         )
         return
 
@@ -633,6 +650,7 @@ def render_ranking(
         empty_state(
             "No candidates match these filters",
             "Widen the similarity range or clear the recommendation filter.",
+            icon="search",
         )
         return
 
@@ -664,7 +682,7 @@ def render_ranking(
             coverage_chart(analysed_rows)
         else:
             section("Skill coverage", "Available once candidates have been analysed.")
-            empty_state("Nothing analysed yet", NOT_ANALYZED_HINT)
+            empty_state("Nothing analysed yet", NOT_ANALYZED_HINT, icon="analysis")
 
     rule()
     _selection_controls(state, visible)
@@ -845,7 +863,11 @@ def render_candidate(
 
     if not candidate_id:
         masthead("Candidate detail", "Select a candidate from the ranking to see their analysis.")
-        empty_state("No candidate selected", "Pick one on the Ranking page.")
+        empty_state(
+            "No candidate selected",
+            "Pick one on the Ranking page.",
+            icon="person",
+        )
         st.markdown("")
         if st.button("Go to ranking", type="primary"):
             ui_state.goto(state, "Ranking")
@@ -1053,6 +1075,7 @@ def _render_evidence(analysis: Mapping[str, Any]) -> None:
             "No evidence was retrieved",
             "Nothing in this resume was close enough to the job description to retrieve. "
             "Treat the interpretation above with corresponding caution.",
+            icon="analysis",
         )
         return
 
@@ -1123,6 +1146,7 @@ def render_resumes(
         empty_state(
             "The pool is empty",
             "Add PDF resumes on the Screening page. They stay here until you remove them.",
+            icon="document",
         )
         _render_unreadable(unreadable)
         return
@@ -1154,17 +1178,11 @@ def _session_controls(state: MutableMapping[str, Any]) -> None:
 
     with columns[1]:
         job = ui_state.get_job_description(state)
+        note = "Resumes are not deleted. To empty the pool, use Clear resume pool below."
         if job:
-            st.markdown(
-                f"<p class='rs-note rs-wrap'>Current session: {truncate(job, 140)}</p>",
-                unsafe_allow_html=True,
-            )
+            info_panel(f"Current session: {truncate(job, 140)}", note)
         else:
-            st.markdown(
-                "<p class='rs-note'>No role described in this session yet.</p>",
-                unsafe_allow_html=True,
-            )
-        st.caption("Resumes are not deleted. To empty the pool, use Clear resume pool below.")
+            info_panel("No role described in this session yet.", note)
 
 
 def _resume_list(
